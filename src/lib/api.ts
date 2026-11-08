@@ -1264,6 +1264,18 @@ export function updateDownload(): Promise<void> {
   return call<unknown>("update_download").then(() => undefined);
 }
 
+/**
+ * 取消正在进行的更新包下载（桌面专属）。
+ *
+ * 幂等：没有下载在跑时后端直接返回成功，不算一次失败，也不会进自动重试退避。
+ * 取消成功后阶段回到「可升级」，用户可以直接再点一次下载。
+ */
+export function updateCancelDownload(): Promise<void> {
+  if (demoModeEnabled) return Promise.reject(new Error(DEMO_UNAVAILABLE_MESSAGE));
+  if (isWebui()) return Promise.reject(new Error(UPDATE_UNSUPPORTED_MESSAGE));
+  return call<unknown>("update_cancel_download").then(() => undefined);
+}
+
 /** 安装已下载的更新包并重启（用户点「重启以完成升级」时调用）。 */
 export function updateRestart(): Promise<void> {
   if (demoModeEnabled) return Promise.reject(new Error(DEMO_UNAVAILABLE_MESSAGE));

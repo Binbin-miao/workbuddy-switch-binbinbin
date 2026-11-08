@@ -30,6 +30,7 @@ interface UpdateInstallDialogProps {
 export function UpdateInstallDialog({ open, onOpenChange }: UpdateInstallDialogProps) {
   const snapshot = useUpdateState();
   const [restarting, setRestarting] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
 
   const phase = snapshot.phase;
@@ -41,8 +42,15 @@ export function UpdateInstallDialog({ open, onOpenChange }: UpdateInstallDialogP
     if (!open) return;
     // 每次打开重置本地动作态：阶段与错误文案都由快照承载。
     setRestarting(false);
+    setCancelling(false);
     setActionError(null);
   }, [open]);
+
+  // 阶段离开 downloading（取消成功 / 换源 / 完成 / 失败）就松开取消按钮：
+  // 留着 disabled 会让用户以为卡死，而实际上已经可以再点下载了。
+  useEffect(() => {
+    if (phase !== "downloading") setCancelling(false);
+  }, [phase]);
 
   async function startDownload() {
     setActionError(null);
@@ -50,6 +58,21 @@ export function UpdateInstallDialog({ open, onOpenChange }: UpdateInstallDialogP
       await api.updateDownload();
     } catch (e) {
       setActionError(`下载更新失败：${api.asError(e)}`);
+    }
+  }
+
+  /**
+   * 取消后台下载：后端幂等，取消成功后阶段回到「可升级」并保留最新版本号，
+   * 用户可以随时再点一次下载。`cancelling` 只防连点，阶段一变就复位。
+   */
+  async function cancelDownload() {
+    setCancelling(true);
+    setActionError(null);
+    try {
+      await api.updateCancelDownload();
+    } catch (e) {
+      setCancelling(false);
+      setActionError(`取消下载失败：${api.asError(e)}`);
     }
   }
 
@@ -166,6 +189,20 @@ export function UpdateInstallDialog({ open, onOpenChange }: UpdateInstallDialogP
                 className="h-full rounded-full bg-primary transition-[width] duration-200"
                 style={{ width: `${percent ?? 30}%` }}
               />
+            </div>
+            <div className="flex items-center justify-between gap-2">
+              <p className="text-xs text-muted-foreground">
+                涓流通道会自动换源，进度偶尔回落属正常。
+              </p>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => void cancelDownload()}
+                disabled={cancelling}
+              >
+                {cancelling && <Loader2 className="animate-spin" />}
+                {cancelling ? "正在取消…" : "取消下载"}
+              </Button>
             </div>
           </div>
         )}
