@@ -384,6 +384,8 @@ fn build_statistics(
 
     let mut usage_events = Vec::new();
     let mut usage_totals: HashMap<String, (f64, f64, f64)> = HashMap::new();
+    // 获取口径看余额总量的正向变化（签到/活动/套餐额度都算），与消耗共享同一个窗口函数。
+    let mut grant_totals: HashMap<String, (f64, f64, f64)> = HashMap::new();
     let mut daily_usage: HashMap<String, HashMap<String, f64>> = HashMap::new();
     let mut latest_snapshots = HashMap::new();
     for (account_id, mut snapshots) in by_account {
@@ -394,22 +396,39 @@ fn build_statistics(
         for pair in snapshots.windows(2) {
             let previous = &pair[0];
             let current = &pair[1];
+            // 增量一律归到后一条快照的本地日期，与消耗完全一致。
+            let Some(date) = local_date_string(current.ts) else {
+                continue;
+            };
+            let (today_hit, week_hit, month_hit) = usage_in_windows(&date, today);
+
+            // 获取：总量下降（到期/重置）与持平都不计，绝不出现负数。
+            let grant = current.total - previous.total;
+            if grant > f64::EPSILON {
+                let entry = grant_totals.entry(account_id.clone()).or_default();
+                if today_hit {
+                    entry.0 += grant;
+                }
+                if week_hit {
+                    entry.1 += grant;
+                }
+                if month_hit {
+                    entry.2 += grant;
+                }
+            }
+
             let amount = previous.remaining - current.remaining;
             if amount <= f64::EPSILON {
                 continue;
             }
-            let Some(date) = local_date_string(current.ts) else {
-                continue;
-            };
             let entry = usage_totals.entry(account_id.clone()).or_default();
-            let (today_usage, week_usage, month_usage) = usage_in_windows(&date, today);
-            if today_usage {
+            if today_hit {
                 entry.0 += amount;
             }
-            if week_usage {
+            if week_hit {
                 entry.1 += amount;
             }
-            if month_usage {
+            if month_hit {
                 entry.2 += amount;
             }
             *daily_usage
@@ -496,6 +515,8 @@ fn build_statistics(
                 .get(account_id)
                 .copied()
                 .unwrap_or_default();
+            let (credit_today, _, credit_month) =
+                grant_totals.get(account_id).copied().unwrap_or_default();
             let today_checkin = checkins
                 .iter()
                 .filter(|event| {
@@ -519,6 +540,8 @@ fn build_statistics(
                 "usageToday": usage_today,
                 "usage7Days": usage_week,
                 "usageThisMonth": usage_month,
+                "creditToday": credit_today,
+                "creditThisMonth": credit_month,
                 "checkedInToday": today_checkin.map(|event| event.result == "success" || event.result == "already"),
                 "checkinStatusToday": today_checkin.map(|event| event.result.clone()),
                 "lastCheckinAt": last_checkin.map(|event| event.ts),
@@ -595,6 +618,8 @@ fn build_statistics(
             "usageToday": usage_totals.values().map(|value| value.0).sum::<f64>(),
             "usage7Days": usage_totals.values().map(|value| value.1).sum::<f64>(),
             "usageThisMonth": usage_totals.values().map(|value| value.2).sum::<f64>(),
+            "creditToday": grant_totals.values().map(|value| value.0).sum::<f64>(),
+            "creditThisMonth": grant_totals.values().map(|value| value.2).sum::<f64>(),
             "todayCheckedInAccounts": today_checked_in_accounts,
             "todaySuccess": today_success,
             "todayAlready": today_already,
@@ -653,6 +678,32 @@ mod tests {
             remaining,
             variant,
         )
+    }
+
+    /// 可同时指定 `total` 与 `remaining` 的快照：获取口径看 `total` 增量。
+    fn snap_total(ts: i64, total: f64, remaining: f64) -> Value {
+        snapshot_value(ts, "account-1", "one@example.com", total, remaining, WbVariant::Cn)
+    }
+
+    /// 精确到分钟的本地时间，用于构造跨日边界（23:59 → 00:01）。
+    fn at_local_minute(days_ago: i64, hour: u32, minute: u32) -> i64 {
+        let today = Local::now().date_naive() - ChronoDuration::days(days_ago);
+        Local
+            .with_ymd_and_hms(today.year(), today.month(), today.day(), hour, minute, 0)
+            .single()
+            .expect("valid local test date")
+            .timestamp_millis()
+    }
+
+    /// 上个月最后一天的本地时间，用于验证上月增量不进本月。
+    fn at_previous_month_last_day(hour: u32) -> i64 {
+        let today = Local::now().date_naive();
+        let last_day = today.with_day(1).expect("每月都有 1 号") - ChronoDuration::days(1);
+        Local
+            .with_ymd_and_hms(last_day.year(), last_day.month(), last_day.day(), hour, 0, 0)
+            .single()
+            .expect("valid local test date")
+            .timestamp_millis()
     }
 
     /// 旧快照没有 `variant` 字段：按国内版解释，且统计行显式带档位。
@@ -791,6 +842,114 @@ mod tests {
         assert_eq!(stats["summary"]["usageToday"], 10.0);
         assert_eq!(stats["summary"]["usage7Days"], 10.0);
         assert_eq!(stats["events"].as_array().unwrap().len(), 1);
+    }
+
+    /// 总量上涨即获取：summary 与账号行都要给出今日/本月值。
+    #[test]
+    fn 积分获取_总量上涨计入今日与本月() {
+        let now = at_local_date(0, 12);
+        let stats = build_statistics(
+            &[
+                snap_total(now - 60_000, 100.0, 100.0),
+                snap_total(now, 200.0, 200.0),
+            ],
+            &[],
+            &[],
+            now,
+        );
+
+        assert_eq!(stats["summary"]["creditToday"], 100.0);
+        assert_eq!(stats["summary"]["creditThisMonth"], 100.0);
+        assert_eq!(stats["accounts"][0]["creditToday"], 100.0);
+        assert_eq!(stats["accounts"][0]["creditThisMonth"], 100.0);
+        // 获取不改变既有消耗口径。
+        assert_eq!(stats["summary"]["usageToday"], 0.0);
+    }
+
+    /// 总量下降（到期/重置）不计，且绝不出现负数获取。
+    #[test]
+    fn 积分获取_总量下降不计也不出负数() {
+        let now = at_local_date(0, 12);
+        let yesterday = at_local_date(1, 12);
+        let stats = build_statistics(
+            &[
+                snap_total(yesterday, 100.0, 90.0),
+                snap_total(now, 80.0, 70.0),
+            ],
+            &[],
+            &[],
+            now,
+        );
+
+        assert_eq!(stats["summary"]["creditToday"], 0.0);
+        assert_eq!(stats["summary"]["creditThisMonth"], 0.0);
+        assert_eq!(stats["summary"]["usageToday"], 20.0);
+    }
+
+    /// 账号首条快照没有前值，不补记任何获取。
+    #[test]
+    fn 积分获取_首条快照不计获取() {
+        let now = at_local_date(0, 12);
+        let stats = build_statistics(&[snap_total(now, 250.0, 250.0)], &[], &[], now);
+
+        assert_eq!(stats["summary"]["creditToday"], 0.0);
+        assert_eq!(stats["summary"]["creditThisMonth"], 0.0);
+    }
+
+    /// 增量归属后一条快照的本地日期：昨天 23:59 → 今天 00:01 记今日。
+    #[test]
+    fn 积分获取_增量归属后一条快照的本地日期() {
+        let now = at_local_date(0, 12);
+        let stats = build_statistics(
+            &[
+                snap_total(at_local_minute(1, 23, 59), 100.0, 100.0),
+                snap_total(at_local_minute(0, 0, 1), 180.0, 180.0),
+            ],
+            &[],
+            &[],
+            now,
+        );
+
+        assert_eq!(stats["summary"]["creditToday"], 80.0);
+        assert_eq!(stats["summary"]["creditThisMonth"], 80.0);
+    }
+
+    /// 上个月的增量只属于上月，不进本月窗口。
+    #[test]
+    fn 积分获取_上月增量不计入本月() {
+        let now = at_local_date(0, 12);
+        let last_month = at_previous_month_last_day(20);
+        let stats = build_statistics(
+            &[
+                snap_total(last_month - 3_600_000, 100.0, 100.0),
+                snap_total(last_month, 140.0, 140.0),
+            ],
+            &[],
+            &[],
+            now,
+        );
+
+        assert_eq!(stats["summary"]["creditThisMonth"], 0.0);
+        assert_eq!(stats["summary"]["creditToday"], 0.0);
+    }
+
+    /// 总量完全相同时视为没有获取，不重复计。
+    #[test]
+    fn 积分获取_总量相同时不重复计() {
+        let now = at_local_date(0, 12);
+        let stats = build_statistics(
+            &[
+                snap_total(now - 60_000, 100.0, 100.0),
+                snap_total(now, 100.0, 90.0),
+            ],
+            &[],
+            &[],
+            now,
+        );
+
+        assert_eq!(stats["summary"]["creditToday"], 0.0);
+        assert_eq!(stats["summary"]["creditThisMonth"], 0.0);
+        assert_eq!(stats["summary"]["usageToday"], 10.0);
     }
 
     #[test]
