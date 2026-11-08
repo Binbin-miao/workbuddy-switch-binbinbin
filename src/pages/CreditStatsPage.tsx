@@ -13,6 +13,7 @@ import {
   Sparkles,
   RefreshCw,
   TrendingDown,
+  TrendingUp,
   Users,
   // XCircle, // 最近事件卡片隐藏后未使用
   type LucideIcon,
@@ -221,11 +222,16 @@ function recomputeLocalStats(
   let usageToday = 0;
   let usage7Days = 0;
   let usageThisMonth = 0;
+  let creditToday = 0;
+  let creditThisMonth = 0;
   const usageByDate = new Map<string, number>();
   for (const account of accounts) {
     usageToday += account.usageToday;
     usage7Days += account.usage7Days;
     usageThisMonth += account.usageThisMonth;
+    // 旧后端不下发获取字段，缺省按 0 处理。
+    creditToday += account.creditToday ?? 0;
+    creditThisMonth += account.creditThisMonth ?? 0;
     // 与后端口径一致：currentRemaining / currentCapacity 只统计 isCurrent 账号
     if (account.isCurrent) {
       currentRemaining += account.currentRemaining ?? 0;
@@ -259,6 +265,8 @@ function recomputeLocalStats(
       usageToday,
       usage7Days,
       usageThisMonth,
+      creditToday,
+      creditThisMonth,
       todayCheckedInAccounts: checkedIn.size,
       todaySuccess,
       todayAlready,
@@ -1901,30 +1909,50 @@ export default function CreditStatsPage() {
               )}
 
               <Card className="min-w-0 gap-0 overflow-hidden rounded-2xl bg-card/70 py-0 shadow-none" aria-label="积分总览">
-                <CardContent className="grid min-w-0 grid-cols-1 divide-y divide-border/60 p-0 sm:grid-cols-4 sm:divide-y-0 sm:py-5">
-                  <StatMetric
-                    icon={Sparkles}
-                    label="剩余积分"
-                    value={formatCredits(filteredStats.summary.currentRemaining)}
-                  />
-                  <StatMetric
-                    icon={TrendingDown}
-                    label="今日消耗"
-                    value={formatCredits(official ? official.summary.usageToday : filteredStats.summary.usageToday)}
-                    divided
-                  />
-                  <StatMetric
-                    icon={CalendarDays}
-                    label="近 7 天消耗"
-                    value={formatCredits(official ? official.summary.usage7Days : filteredStats.summary.usage7Days)}
-                    divided
-                  />
-                  <StatMetric
-                    icon={CalendarRange}
-                    label="本月消耗"
-                    value={formatCredits(official ? official.summary.usageThisMonth : filteredStats.summary.usageThisMonth)}
-                    divided
-                  />
+                <CardContent className="min-w-0 p-0">
+                  {/* 上排：进账。官方用量接口没有获取数据，两张卡固定用本地观察口径。 */}
+                  <div className="grid min-w-0 grid-cols-1 divide-y divide-border/60 sm:grid-cols-2 sm:divide-y-0 sm:py-5">
+                    <StatMetric
+                      icon={TrendingUp}
+                      label="今日获取"
+                      value={formatCredits(filteredStats.summary.creditToday)}
+                    />
+                    <StatMetric
+                      icon={TrendingUp}
+                      label="本月获取"
+                      value={formatCredits(filteredStats.summary.creditThisMonth)}
+                      divided
+                    />
+                  </div>
+                  <p className="px-4 pb-3 text-xs text-muted-foreground sm:px-5">
+                    获取按本地观察快照的余额上涨统计，含签到、活动与套餐额度；App 未运行的时段可能漏计。
+                  </p>
+                  {/* 下排：消耗与剩余。 */}
+                  <div className="grid min-w-0 grid-cols-1 divide-y divide-border/60 border-t border-border/60 sm:grid-cols-4 sm:divide-y-0 sm:py-5">
+                    <StatMetric
+                      icon={Sparkles}
+                      label="剩余积分"
+                      value={formatCredits(filteredStats.summary.currentRemaining)}
+                    />
+                    <StatMetric
+                      icon={TrendingDown}
+                      label="今日消耗"
+                      value={formatCredits(official ? official.summary.usageToday : filteredStats.summary.usageToday)}
+                      divided
+                    />
+                    <StatMetric
+                      icon={CalendarDays}
+                      label="近 7 天消耗"
+                      value={formatCredits(official ? official.summary.usage7Days : filteredStats.summary.usage7Days)}
+                      divided
+                    />
+                    <StatMetric
+                      icon={CalendarRange}
+                      label="本月消耗"
+                      value={formatCredits(official ? official.summary.usageThisMonth : filteredStats.summary.usageThisMonth)}
+                      divided
+                    />
+                  </div>
                 </CardContent>
               </Card>
 

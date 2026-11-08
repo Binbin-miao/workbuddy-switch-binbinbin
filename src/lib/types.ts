@@ -839,6 +839,9 @@ export interface CreditStatsSummary {
   usageToday: number;
   usage7Days: number;
   usageThisMonth: number;
+  /** 获取口径：本地观察快照的余额总量上涨（含签到/活动/套餐额度） */
+  creditToday: number;
+  creditThisMonth: number;
   todayCheckedInAccounts: number;
   todaySuccess: number;
   todayAlready: number;
@@ -862,6 +865,9 @@ export interface CreditStatsAccount {
   usageToday: number;
   usage7Days: number;
   usageThisMonth: number;
+  /** 获取口径（可选：兼容尚未下发该字段的旧后端，缺省按 0 处理） */
+  creditToday?: number;
+  creditThisMonth?: number;
   checkedInToday: boolean | null;
   checkinStatusToday: string | null;
   lastCheckinAt: number | null;

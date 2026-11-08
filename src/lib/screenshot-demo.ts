@@ -370,6 +370,9 @@ function buildStatistics(): CreditStatistics {
   const usageThisMonth = sumMonth(daily);
   const totalRemaining = creditRows.reduce((sum, credit) => sum + (credit.totalRemaining ?? 0), 0);
   const totalCapacity = creditRows.reduce((sum, credit) => sum + (credit.totalCapacity ?? 0), 0);
+  // 获取口径演示值：4 个国内版账号各 100（今日）/ 800（本月），与下方 accounts 行保持自洽。
+  const creditToday = 400;
+  const creditThisMonth = 3200;
 
   return {
     generatedAt,
@@ -377,7 +380,7 @@ function buildStatistics(): CreditStatistics {
     coverageStartAt: atLocalTime(29, 0, 0),
     // 签到计数与 `checkinLogs()` / `events` 的构造规则保持一致：
     // 支持签到的账号共 4 个（国内版 A/B/C/D），其中 B 为 already、其余为 success。
-    summary: { currentRemaining: Number(totalRemaining.toFixed(2)), currentCapacity: totalCapacity, usageToday, usage7Days, usageThisMonth, todayCheckedInAccounts: 4, todaySuccess: 3, todayAlready: 1, todayFailed: 0 },
+    summary: { currentRemaining: Number(totalRemaining.toFixed(2)), currentCapacity: totalCapacity, usageToday, usage7Days, usageThisMonth, creditToday, creditThisMonth, todayCheckedInAccounts: 4, todaySuccess: 3, todayAlready: 1, todayFailed: 0 },
     daily,
     accounts: demoAccounts.map((account, index) => {
       // 国际版没有签到接口：签到态一律留空，与 `variantSupportsCheckin` 一致。
@@ -393,6 +396,8 @@ function buildStatistics(): CreditStatistics {
         usageToday: officialAccounts[index].usageToday ?? 0,
         usage7Days: officialAccounts[index].usage7Days ?? 0,
         usageThisMonth: officialAccounts[index].usageThisMonth ?? 0,
+        creditToday: checkinSupported ? 100 : 0,
+        creditThisMonth: checkinSupported ? 800 : 0,
         checkedInToday: checkinSupported ? true : null,
         checkinStatusToday: checkinSupported ? checkinResult : null,
         lastCheckinAt: checkinSupported ? atLocalTime(0, 8, 6 + index * 9) : null,
