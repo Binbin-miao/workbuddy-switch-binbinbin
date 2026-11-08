@@ -309,6 +309,9 @@ fn checkin_config_with_enabled(enabled: bool) -> Value {
         "lazy_refresh_hours": 24,
         // 签到后给每个账号发一条随机对话，用于点亮月活跃地图（服务端要求当天完成一次对话）。
         "chat_on_checkin": true,
+        // 本地时间 9 点前不发日常对话：活跃判定受服务端跨日结算影响，0 点前后那一批点不亮。
+        // 0 = 不限制（退回旧行为）。
+        "chat_after_hour": 9,
     })
 }
 
@@ -344,6 +347,12 @@ fn apply_checkin_config(merged: &mut Value, input: &Value) {
     // 签到后自动发对话：老配置没这个键时沿用默认值，不会被静默关掉。
     if let Some(chat) = map.get("chat_on_checkin").and_then(Value::as_bool) {
         merged["chat_on_checkin"] = json!(chat);
+    }
+    // 发送下限小时：0 表示不限制；非法值（<0 或 >23）回落默认 9，不让一个脏数字把功能打死。
+    if let Some(hour) = map.get("chat_after_hour").and_then(Value::as_i64) {
+        if (0..=23).contains(&hour) {
+            merged["chat_after_hour"] = json!(hour);
+        }
     }
     // 仅用稳定账号 id 排除自动签到；忽略无效项并去重，旧配置默认全部参与。
     if let Some(ids) = map.get("excluded_account_ids").and_then(Value::as_array) {
@@ -1285,6 +1294,34 @@ mod tests {
             legacy.get("lazy_refresh_hours").and_then(Value::as_i64),
             Some(24)
         );
+    }
+
+    /// [D1] `chat_after_hour` 默认 9；合并只接受 `0..=23`，脏值一律回落默认 9，
+    /// 不让一个写坏的数字把「日常对话」整轮打死。
+    #[test]
+    fn chat_after_hour_defaults_to_nine_and_rejects_out_of_range() {
+        for cfg in [default_checkin_config(), legacy_default_checkin_config()] {
+            assert_eq!(
+                cfg.get("chat_after_hour").and_then(Value::as_i64),
+                Some(9),
+                "新装与老用户都应拿到默认 9"
+            );
+        }
+
+        for (input, expected) in [
+            (json!({"chat_after_hour": 0}), 0), // 0 合法：等于关掉时间窗
+            (json!({"chat_after_hour": 23}), 23),
+            (json!({"chat_after_hour": 24}), 9),
+            (json!({"chat_after_hour": -1}), 9),
+            (json!({"chat_after_hour": "9"}), 9),
+            (json!({"chat_after_hour": null}), 9),
+        ] {
+            assert_eq!(
+                merge_checkin_config(&input)["chat_after_hour"],
+                json!(expected),
+                "{input} 合并结果不对"
+            );
+        }
     }
 
     #[test]
