@@ -224,7 +224,18 @@ fn parse_streak_days(resp: &Value) -> Result<i64, String> {
 /// 读服务端连登天数：`GET {growth_base}/activity/growth/streak`。
 async fn read_streak_days(account: &Value) -> Result<i64, String> {
     let url = format!("{}/activity/growth/streak", growth_base(account));
-    let headers = crate::modules::account::build_auth_headers(account);
+    let mut headers = crate::modules::account::build_auth_headers(account);
+    // 与同域调用（`growth_tasks` 的 `/v2/chat/completions`）对齐，补两个成长域头。
+    //
+    // 注意：本机实测这个接口只带 `Authorization` + `Accept` + `X-User-Id` 就已返回 200
+    // 且数据完整，服务端当前**不强制**这两个头。补它们纯属防御性对齐 —— 万一将来收紧，
+    // 这里会静默退化成 `verify: "unknown"`（只记原因、不影响发送），多带两个头就是为了
+    // 别让这种静默失效拖到没人发现。
+    headers.insert("X-Product".to_string(), "SaaS".to_string());
+    headers.insert(
+        "X-Domain".to_string(),
+        crate::modules::growth_auto::report_host(account).to_string(),
+    );
     let resp = crate::modules::config::http_request(&url, "GET", None, Some(&headers)).await;
     parse_streak_days(&resp)
 }
@@ -296,13 +307,26 @@ pub async fn ensure_sent_today(accounts: Vec<Value>, after_hour: u32) -> Value {
 
     for (index, (key, account, phrase)) in pending.into_iter().enumerate() {
         let email = crate::modules::account::account_display_name(&account);
-        let account = crate::modules::refresh::ensure_fresh_token(account, &cfg).await;
-        // 发前、发后各回读一次连登天数：只用于自证今天有没有点亮，不参与 `ok` 判定。
-        let days_before = read_streak_days(&account).await.ok();
-        let outcome = crate::modules::growth_tasks::chat_with_prompt(&account, phrase).await;
-        let days_after = read_streak_days(&account).await.ok();
-        let verify = verify_state(days_before, days_after);
+        // 每个账号单独成一个任务再 await：任一账号 panic 只会变成 `JoinError`，损失这一个
+        // 账号；inline await 则是整个 `ensure_sent_today` unwind，顺着 `run_checkin_cycle`
+        // 打穿 src-tauri 的后台 loop（无 catch_unwind、无外层重启）→ 签到一起停摆。
+        let task_cfg = cfg.clone();
+        let job = tokio::spawn(async move {
+            let account = crate::modules::refresh::ensure_fresh_token(account, &task_cfg).await;
+            // 发前、发后各回读一次连登天数：只用于自证今天有没有点亮，不参与 `ok` 判定。
+            let days_before = read_streak_days(&account).await.ok();
+            let chat = crate::modules::growth_tasks::chat_with_prompt(&account, phrase).await;
+            let days_after = read_streak_days(&account).await.ok();
+            (days_before, days_after, chat)
+        })
+        .await;
 
+        // 把「任务 panic」折成与「发送失败」同形的一次结果，后面只走一条记账路径。
+        let (days_before, days_after, chat) = match job {
+            Ok(parts) => parts,
+            Err(join_error) => (None, None, Err(format!("任务异常：{join_error}"))),
+        };
+        let verify = verify_state(days_before, days_after);
         let mut row = json!({
             "ts": now_ms(),
             "day": day,
@@ -313,7 +337,7 @@ pub async fn ensure_sent_today(accounts: Vec<Value>, after_hour: u32) -> Value {
             "daysAfter": days_after,
             "verify": verify,
         });
-        match outcome {
+        match chat {
             Ok((conversation_id, _request_id)) => {
                 sent += 1;
                 results.push(json!({
