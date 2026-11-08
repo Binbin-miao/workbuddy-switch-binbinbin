@@ -133,6 +133,8 @@ pub fn throughput_is_stalled(elapsed: Duration, bytes: u64, total: Option<u64>) 
     let Some(total) = total else {
         return false;
     };
+    // 第 2 条边界：本意是「已下满 100% 不判」。注意宿主传进来的 `bytes` 是**窗口增量**，
+    // 不是累计量，所以本分支在宿主路径上是纯兜底、实际不触发 —— 别据此推断参数语义。
     if bytes >= total {
         return false;
     }
@@ -161,8 +163,10 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// 镜像直连的建连超时（更短：镜像不通就马上换下一个候选）。
 const MIRROR_CONNECT_TIMEOUT: Duration = Duration::from_secs(6);
 
-/// 空闲超时：连续这么久没收到任何字节就判定这条线路已死。
-/// 用「空闲」而不是「总时长」，慢速线路才能跑完（8.5 MB 走 50 KB/s 需要近 3 分钟）。
+/// 空闲超时：连续这么久**一个字节都没收到**就判定这条连接已死。
+///
+/// 慢于速度地板（80 KB/s）的通道由涓流判据负责换源，不归这里管：本超时只负责判死
+/// 完全停住的连接。用「空闲」而不是「总时长」，才能让慢速线路跑到最后一块。
 const IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// 速度地板的滑动窗口：判涓流看的是「最近这么久内的平均吞吐」，不是整段均速。
@@ -404,14 +408,34 @@ struct Probe {
     ranged: bool,
 }
 
-async fn probe(client: &reqwest::Client, url: &str) -> Result<Probe, String> {
-    let response = client
+/// 等到取消标志置位为止：把「本来不可打断的等待」（建链、等响应头）变成可打断的。
+///
+/// 节拍与 [D7] 的分块轮询同为 `CANCEL_POLL`，所以取消的响应上界仍然是 500ms 级。
+async fn wait_until_cancelled(control: &DownloadControl) {
+    while !control.is_cancelled() {
+        tokio::time::sleep(CANCEL_POLL).await;
+    }
+}
+
+/// 探测：只看响应头，拿总长度与是否支持 Range。
+///
+/// 建链最长要吃满 `MIRROR_CONNECT_TIMEOUT`（6 秒），这段等待必须能被取消打断，
+/// 否则用户点了「取消下载」还得干等建链超时，UI 一直卡在「正在取消…」。
+async fn probe(
+    client: &reqwest::Client,
+    url: &str,
+    control: &DownloadControl,
+) -> Result<Probe, String> {
+    control.check()?;
+    let request = client
         .get(url)
         .header(reqwest::header::RANGE, "bytes=0-0")
         .timeout(PROBE_TIMEOUT)
-        .send()
-        .await
-        .map_err(|error| format!("连接失败：{}", describe(&error)))?;
+        .send();
+    let response = tokio::select! {
+        result = request => result.map_err(|error| format!("连接失败：{}", describe(&error)))?,
+        () = wait_until_cancelled(control) => return Err(CANCELLED_ERROR.to_string()),
+    };
     let status = response.status();
     if status == reqwest::StatusCode::PARTIAL_CONTENT {
         let total = response
@@ -447,7 +471,7 @@ pub async fn fetch(
     // 进度归零不变量（[D5]）：每个候选都从 0 重新累计，换源后百分比必须能回落。
     control.reset_progress();
     let client = build_client(proxy, is_mirror_url(url))?;
-    let probe = probe(&client, url).await?;
+    let probe = probe(&client, url, control).await?;
     let total = probe.total;
     let bytes = match total {
         Some(total) if probe.ranged && total >= MIN_SEGMENT_BYTES => {
@@ -879,6 +903,9 @@ mod tests {
         /// 只在探测请求（bytes=0-0）上回 206，其余分段请求回 200 —— 模拟「说支持、
         /// 实际不支持」的镜像。
         ProbeOnly,
+        /// 老实回 206，但只吐一小段就挂住不关 —— 模拟「涓流镜像中途断流」，
+        /// 用来验证取消 / 停滞检查点能真的打断进行中的读取。
+        Stall,
     }
 
     struct RangeServer {
@@ -955,9 +982,13 @@ mod tests {
         use std::io::Write;
 
         let request = read_request_head(stream);
+        if mode == RangeMode::Stall {
+            respond_stalled(stream, body, &request, range_requests);
+            return;
+        }
         let range = match mode {
             RangeMode::Ignore => None,
-            RangeMode::Honest => parse_request_range(&request),
+            RangeMode::Honest | RangeMode::Stall => parse_request_range(&request),
             RangeMode::ProbeOnly => parse_request_range(&request)
                 .filter(|(start, end)| *start == 0 && *end == 0),
         };
@@ -990,6 +1021,41 @@ mod tests {
         };
         let _ = stream.write_all(&response);
         let _ = stream.flush();
+    }
+
+    /// Stall 模式的服务端：回真实的 206 头 + 第一块 4 KiB，然后挂住不关连接。
+    ///
+    /// 头部按整段长度声明 `Content-Length`，客户端会一直等剩下的字节 —— 正是
+    /// 「涓流镜像中途断流」的现场，检查点必须能从这种等待里把控制权抢回来。
+    fn respond_stalled(
+        stream: &mut std::net::TcpStream,
+        body: &[u8],
+        request: &str,
+        range_requests: &AtomicU64,
+    ) {
+        use std::io::Write;
+
+        let (start, end) = parse_request_range(request)
+            .map(|(start, end)| {
+                (
+                    start as usize,
+                    (end as usize).min(body.len().saturating_sub(1)),
+                )
+            })
+            .unwrap_or((0, body.len().saturating_sub(1)));
+        range_requests.fetch_add(1, Ordering::Relaxed);
+        let slice = &body[start..=end];
+        let head = format!(
+            "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {start}-{end}/{}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+            slice.len(),
+            body.len()
+        )
+        .into_bytes();
+        let _ = stream.write_all(&head);
+        let _ = stream.write_all(&slice[..slice.len().min(4096)]);
+        let _ = stream.flush();
+        // 挂住：让客户端的 `chunk()` 一直等下去，用例必须在 2 秒内把控制权抢回来。
+        std::thread::sleep(Duration::from_secs(5));
     }
 
     /// 读到空行为止：请求头可能被拆成多个 TCP 段，只读一次会漏掉 `Range`。
@@ -1136,5 +1202,70 @@ mod tests {
         sorted_input.sort();
         sorted_output.sort();
         assert_eq!(sorted_input, sorted_output);
+    }
+
+    /// 端到端（[D4] 响应上界）：读到一半点取消，必须在 500ms 级返回「已取消」，
+    /// 而不是等这条连接自己读完或空闲超时。断言顺带证明控制类失败不重试分片。
+    #[tokio::test]
+    async fn 取消_流式中途置位后两秒内返回已取消() {
+        let body: Vec<u8> = (0..3 * 1024 * 1024).map(|index| (index % 251) as u8).collect();
+        let server = RangeServer::start(body, RangeMode::Stall);
+        let control = Arc::new(DownloadControl::new());
+        let progress: Progress = Arc::new(|_, _| {});
+        let url = server.url();
+        let task_control = Arc::clone(&control);
+        let started = Instant::now();
+        let download = tokio::spawn(async move { fetch(&url, None, &task_control, progress).await });
+
+        // 等到探测 + 4 条分片都建好连接（说明真的在流式读），再点取消。
+        while server.range_requests() < 5 && started.elapsed() < Duration::from_secs(3) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(server.range_requests() >= 5, "分片连接没起来，用例前提不成立");
+
+        control.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(2), download)
+            .await
+            .expect("取消后必须立刻返回，不能等连接自己结束")
+            .expect("下载任务不该 panic");
+        assert_eq!(result.expect_err("取消必须让下载失败"), CANCELLED_ERROR);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "取消响应超上界：{:?}",
+            started.elapsed()
+        );
+        assert_eq!(server.range_requests(), 5, "取消属于控制类失败，不许重试分片");
+    }
+
+    /// 端到端（[D1] 判定结果）：停滞置位后必须返回「速度过低」且**不重试**。
+    ///
+    /// 重试会把换源再拖后 2×300ms 起，还可能让后面本来能用的候选永远轮不到。
+    #[tokio::test]
+    async fn 停滞_置位后返回速度过低且不重试() {
+        let body: Vec<u8> = (0..3 * 1024 * 1024).map(|index| (index % 131) as u8).collect();
+        let server = RangeServer::start(body, RangeMode::Stall);
+        let control = Arc::new(DownloadControl::new());
+        let progress: Progress = Arc::new(|_, _| {});
+        let url = server.url();
+        let task_control = Arc::clone(&control);
+        let started = Instant::now();
+        let download = tokio::spawn(async move { fetch(&url, None, &task_control, progress).await });
+
+        while server.range_requests() < 5 && started.elapsed() < Duration::from_secs(3) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(server.range_requests() >= 5, "分片连接没起来，用例前提不成立");
+
+        control.stall("窗口吞吐 16 KB/s 低于 80 KB/s 地板");
+        let result = tokio::time::timeout(Duration::from_secs(3), download)
+            .await
+            .expect("停滞判定后必须立刻放弃这条通道")
+            .expect("下载任务不该 panic");
+        assert_eq!(result.expect_err("停滞必须让下载失败"), STALLED_ERROR);
+        assert_eq!(
+            server.range_requests(),
+            5,
+            "控制类失败不许重试：探测 1 次 + 分片各 1 次"
+        );
     }
 }

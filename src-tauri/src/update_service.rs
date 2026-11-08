@@ -872,6 +872,11 @@ async fn download_verified<R: Runtime>(
 ///
 /// `bytes` 传窗口内的**增量**而不是累计量：整段均速会被前一段的快跑掩盖，
 /// 用户看到的「卡在 85% 再也不动」正是后段涓流，只有窗口增量判得出来。
+///
+/// **首判要比常规窗口晚 `STALL_WARMUP`（即 20 秒）**：`probe()` 的 1.5 MiB 测速与建链
+/// 时间只进分母、不进分子（它们不经过 `control.record_bytes`）。若首窗仍是 15 秒，
+/// 一条稳态 110 KB/s 的正常通道会被稀释成 ≈73 KB/s 而误判涓流，换源后还会按同一
+/// 机制连续误杀。之后每轮恢复 15 秒滑动窗口。
 fn spawn_stall_watch(
     control: Arc<update_download::DownloadControl>,
     total: Arc<AtomicU64>,
@@ -879,11 +884,12 @@ fn spawn_stall_watch(
     tokio::spawn(async move {
         let mut window_started = std::time::Instant::now();
         let mut window_bytes = control.downloaded();
+        let mut window_length = update_download::STALL_WINDOW + update_download::STALL_WARMUP;
         loop {
             tokio::time::sleep(STALL_SAMPLE).await;
             let elapsed = window_started.elapsed();
-            // 不足一个窗口就没有判据（[D1] 边界②的预热期也自然被覆盖）。
-            if elapsed < update_download::STALL_WINDOW {
+            // 不足一个窗口就没有判据（首窗是 20 秒，之后 15 秒）。
+            if elapsed < window_length {
                 continue;
             }
             let downloaded = control.downloaded();
@@ -904,6 +910,7 @@ fn spawn_stall_watch(
             // 滑动窗口：判完把窗口起点挪到此刻，下一轮只看新的 15 秒。
             window_started = std::time::Instant::now();
             window_bytes = downloaded;
+            window_length = update_download::STALL_WINDOW;
         }
     })
 }
