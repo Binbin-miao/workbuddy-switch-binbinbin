@@ -233,6 +233,8 @@ const PROBE_CONNECT_TIMEOUT: Duration = Duration::from_millis(1_500);
 /// 写死任何一边都会让另一半用户慢几十倍，所以排序必须是运行时结果。
 ///
 /// 并发探测、互不影响；单条失败只意味着它拿 0 分，不会中断整体。
+///
+/// shortcut: 测速期 ≤5 秒无取消检查点，取消最多延后 5 秒生效（第二轮复审裁定可接受，见 spec [D4]）。
 pub async fn rank_candidates(candidates: &[String], proxy: Option<&str>) -> Vec<String> {
     if candidates.len() <= 1 {
         return candidates.to_vec();
@@ -588,12 +590,16 @@ async fn stream_range(
     progress: &Progress,
 ) -> Result<Vec<u8>, String> {
     control.check()?;
-    let response = client
+    let request = client
         .get(url)
         .header(reqwest::header::RANGE, format!("bytes={start}-{end}"))
-        .send()
-        .await
-        .map_err(|error| format!("请求失败：{}", describe(&error)))?;
+        .send();
+    // 建链要走 `CONNECT_TIMEOUT`（15 秒），4 条分片取最慢者：必须能被取消打断，
+    // 否则用户点「取消下载」最坏要干等 15 秒。
+    let response = tokio::select! {
+        response = request => response.map_err(|error| format!("请求失败：{}", describe(&error)))?,
+        () = wait_until_cancelled(control) => return Err(CANCELLED_ERROR.to_string()),
+    };
     if response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
         return Err(format!(
             "不支持分段下载（HTTP {}）",
@@ -626,11 +632,12 @@ async fn download_stream(
     progress: &Progress,
 ) -> Result<Vec<u8>, String> {
     control.check()?;
-    let response = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|error| format!("请求失败：{}", describe(&error)))?;
+    let request = client.get(url).send();
+    // 同 `stream_range`：单连接同样要能被取消打断，不能在建链里干等 15 秒。
+    let response = tokio::select! {
+        response = request => response.map_err(|error| format!("请求失败：{}", describe(&error)))?,
+        () = wait_until_cancelled(control) => return Err(CANCELLED_ERROR.to_string()),
+    };
     let status = response.status();
     if !status.is_success() {
         return Err(format!("返回 HTTP {}", status.as_u16()));
@@ -1224,15 +1231,17 @@ mod tests {
         assert!(server.range_requests() >= 5, "分片连接没起来，用例前提不成立");
 
         control.cancel();
+        // 从这一刻起算取消延迟：前置等待本身就允许耗 3 秒，算进总耗时会让慢 CI 假红。
+        let cancel_started = Instant::now();
         let result = tokio::time::timeout(Duration::from_secs(2), download)
             .await
             .expect("取消后必须立刻返回，不能等连接自己结束")
             .expect("下载任务不该 panic");
         assert_eq!(result.expect_err("取消必须让下载失败"), CANCELLED_ERROR);
+        let cancel_latency = cancel_started.elapsed();
         assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "取消响应超上界：{:?}",
-            started.elapsed()
+            cancel_latency < Duration::from_secs(2),
+            "取消到返回超过 2 秒：{cancel_latency:?}"
         );
         assert_eq!(server.range_requests(), 5, "取消属于控制类失败，不许重试分片");
     }

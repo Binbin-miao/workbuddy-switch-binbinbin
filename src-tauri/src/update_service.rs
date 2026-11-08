@@ -887,6 +887,14 @@ fn spawn_stall_watch(
         let mut window_length = update_download::STALL_WINDOW + update_download::STALL_WARMUP;
         loop {
             tokio::time::sleep(STALL_SAMPLE).await;
+            // 窗口只从「首个字节到达」起算：probe 的 ≤5 秒测速与建链期一个字节都不计
+            // 入分子，若把这段零字节期算进分母，等效地板会被抬到 ≈107 KB/s ——
+            // 稳态 100 KB/s 的正常通道（本来就高于 80 KB/s 地板）照样被首窗误杀。
+            // 分母从有字节那一刻起算后，首判自然回落到「首字节 + 15 秒」。
+            if control.downloaded() == 0 {
+                window_started = std::time::Instant::now();
+                continue;
+            }
             let elapsed = window_started.elapsed();
             // 不足一个窗口就没有判据（首窗是 20 秒，之后 15 秒）。
             if elapsed < window_length {
