@@ -13,9 +13,9 @@
 //! 3. **签名兜底**：任何一个镜像返回脏数据 / 半截文件，都会在验签这步被拒，
 //!    绝不可能装进用户机器。
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 
@@ -23,6 +23,125 @@ use crate::modules::config::DEFAULT_HTTP_USER_AGENT;
 
 /// 进度回调：`(累计已下载字节, 总字节)`。多路分段共用一个回调，调用方需自行去抖。
 pub type Progress = Arc<dyn Fn(u64, Option<u64>) + Send + Sync>;
+
+/// 用户主动取消时的错误文案。宿主拿它区分「取消」与「通道失败」。
+pub const CANCELLED_ERROR: &str = "已取消下载";
+
+/// 通道被判涓流 / 超预算时的错误文案；语义是「换个源」，不是「更新失败」。
+pub const STALLED_ERROR: &str = "下载速度过低，已切换下载源";
+
+/// 一次下载阶段的共享控制块：取消标志、停滞标志、累计字节与起始时刻。
+///
+/// 宿主创建 `Arc<DownloadControl>` 后同时交给下载流程与取消命令；core 只负责两件事：
+/// 每个检查点读标志，每收到一块字节就累加到 `downloaded`（宿主据此做滑动窗口采样）。
+pub struct DownloadControl {
+    cancelled: AtomicBool,
+    stalled: AtomicBool,
+    downloaded: AtomicU64,
+    started: Instant,
+}
+
+impl DownloadControl {
+    pub fn new() -> Self {
+        Self {
+            cancelled: AtomicBool::new(false),
+            stalled: AtomicBool::new(false),
+            downloaded: AtomicU64::new(0),
+            started: Instant::now(),
+        }
+    }
+
+    /// 用户点了「取消下载」：幂等，重复置位不改变任何状态。
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+
+    /// 宿主判定当前候选涓流 / 超预算时置位，core 会在下一个检查点放弃这条通道。
+    ///
+    /// `reason` 只进日志：用户看到的固定是 [`STALLED_ERROR`]，换源成功就不该让他看见抖动。
+    pub fn stall(&self, reason: &str) {
+        eprintln!("[更新] 判定下载停滞：{reason}");
+        self.stalled.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_stalled(&self) -> bool {
+        self.stalled.load(Ordering::SeqCst)
+    }
+
+    /// 累计已下载字节，供宿主的滑动窗口采样。
+    pub fn record_bytes(&self, bytes: u64) {
+        self.downloaded.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// 失败重试前把多算的字节退回，否则重试会让进度虚高。
+    pub fn release_bytes(&self, bytes: u64) {
+        self.downloaded.fetch_sub(bytes, Ordering::Relaxed);
+    }
+
+    pub fn downloaded(&self) -> u64 {
+        self.downloaded.load(Ordering::Relaxed)
+    }
+
+    /// 换候选时进度必须从 0 重新累计（[D5]），否则会出现「只下了 15% 却显示 100%」。
+    pub fn reset_progress(&self) {
+        self.downloaded.store(0, Ordering::Relaxed);
+    }
+
+    /// 下载开始至今的时长，宿主用它判断是否还在预热期内。
+    pub fn elapsed(&self) -> Duration {
+        self.started.elapsed()
+    }
+
+    /// 检查点：命中取消或停滞立即返回。所有 `send()` 之前、每一轮轮询都要过一遍。
+    pub fn check(&self) -> Result<(), String> {
+        if self.is_cancelled() {
+            return Err(CANCELLED_ERROR.to_string());
+        }
+        if self.is_stalled() {
+            return Err(STALLED_ERROR.to_string());
+        }
+        Ok(())
+    }
+}
+
+impl Default for DownloadControl {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// 是不是取消 / 停滞这两个「控制类」失败：它们绝不能当网络错误重试。
+fn is_control_error(error: &str) -> bool {
+    error == CANCELLED_ERROR || error == STALLED_ERROR
+}
+
+/// 窗口吞吐判据（纯函数，可单测）：最近 `elapsed` 内只下了 `bytes` 字节，算不算涓流。
+///
+/// 为什么需要它：`IDLE_TIMEOUT` 判的是「零字节」，而限速镜像每秒仍在回几 KB，
+/// 于是永远不判死、也不换源（实测 gh-proxy.com 16.7 KB/s 卡在 85% 再也不动）。
+///
+/// 四条显式边界，顺序即优先级：
+/// 1. `total` 未知 → 不判：无法排除「正常慢速的小文件」，只受候选预算约束；
+/// 2. 已下满（`bytes >= total`）→ 不判：100% 之后速度归零是正常收尾；
+/// 3. `elapsed < STALL_WARMUP` → 不判：建链与首包本来就没有吞吐；
+/// 4. 其余按 `bytes * 1000 / elapsed_ms < MIN_THROUGHPUT` 判涓流。
+pub fn throughput_is_stalled(elapsed: Duration, bytes: u64, total: Option<u64>) -> bool {
+    let Some(total) = total else {
+        return false;
+    };
+    if bytes >= total {
+        return false;
+    }
+    if elapsed < STALL_WARMUP {
+        return false;
+    }
+    let elapsed_ms = elapsed.as_millis().max(1) as u64;
+    bytes * 1000 / elapsed_ms < MIN_THROUGHPUT
+}
 
 /// 内置 GitHub 镜像前缀（按实测速度排序，直连放最后）。
 ///
@@ -45,6 +164,25 @@ const MIRROR_CONNECT_TIMEOUT: Duration = Duration::from_secs(6);
 /// 空闲超时：连续这么久没收到任何字节就判定这条线路已死。
 /// 用「空闲」而不是「总时长」，慢速线路才能跑完（8.5 MB 走 50 KB/s 需要近 3 分钟）。
 const IDLE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// 速度地板的滑动窗口：判涓流看的是「最近这么久内的平均吞吐」，不是整段均速。
+pub const STALL_WINDOW: Duration = Duration::from_secs(15);
+
+/// 速度地板：窗口内平均吞吐低于这个值即判涓流。
+/// 80 KB/s 是「8.5 MB 包两分钟内下完」的下限，实测正常镜像 316 KB/s、限速镜像 16.7 KB/s。
+pub const MIN_THROUGHPUT: u64 = 80 * 1024;
+
+/// 预热期：刚开始的建链与首包没有吞吐，不该被速度地板误杀。
+pub const STALL_WARMUP: Duration = Duration::from_secs(5);
+
+/// 单个候选的预算：到点判死换下一个候选，别让一条通道拖住整条下载。
+pub const CANDIDATE_BUDGET: Duration = Duration::from_secs(150);
+
+/// 整条下载阶段的总预算（含测速、换源、验签）。
+pub const DOWNLOAD_DEADLINE: Duration = Duration::from_secs(360);
+
+/// 取消 / 停滞的检查点间隔：取消命令的响应上界就是它。
+pub const CANCEL_POLL: Duration = Duration::from_millis(500);
 
 /// 单个分片的重试次数（不含首次）。重试只针对同一分片，不会从头再来。
 const SEGMENT_RETRIES: usize = 2;
@@ -75,11 +213,11 @@ pub fn download_candidates(url: &str) -> Vec<String> {
     candidates
 }
 
-/// 测速样本大小：256 KiB。够判断通道量级，又不必为了排序先下掉半个包。
-const PROBE_SAMPLE_BYTES: u64 = 256 * 1024;
+/// 测速样本大小：1.5 MiB。256 KiB 会被「首包突发」骗过，把限速镜像排到第一。
+const PROBE_SAMPLE_BYTES: u64 = 1536 * 1024;
 
-/// 单个候选的测速预算：拿满样本会立即返回，只有慢/死的通道才吃满这 2.5 秒。
-const PROBE_BUDGET: Duration = Duration::from_millis(2_500);
+/// 单个候选的测速预算：拿满样本会立即返回，只有慢/死的通道才吃满这 5 秒。
+const PROBE_BUDGET: Duration = Duration::from_secs(5);
 
 /// 测速阶段的建连超时：比正式下载短得多——不通就赶紧换下一条。
 const PROBE_CONNECT_TIMEOUT: Duration = Duration::from_millis(1_500);
@@ -297,47 +435,59 @@ async fn probe(client: &reqwest::Client, url: &str) -> Result<Probe, String> {
 }
 
 /// 从单个候选地址下载整包字节。分段是否启用由探测结果决定。
+///
+/// `control` 由宿主用 `Arc` 持有（取消命令也要拿它），这里每个外部动作前都会过一遍检查点。
 pub async fn fetch(
     url: &str,
     proxy: Option<&str>,
+    control: &Arc<DownloadControl>,
     progress: Progress,
 ) -> Result<Vec<u8>, String> {
+    control.check()?;
+    // 进度归零不变量（[D5]）：每个候选都从 0 重新累计，换源后百分比必须能回落。
+    control.reset_progress();
     let client = build_client(proxy, is_mirror_url(url))?;
     let probe = probe(&client, url).await?;
     let total = probe.total;
-    let use_segments =
-        probe.ranged && total.is_some_and(|size| size >= MIN_SEGMENT_BYTES);
-    if !use_segments {
-        return download_stream(&client, url, total, &progress).await;
-    }
-    let total = total.unwrap_or_default();
-    match download_segmented(&client, url, total, &progress).await {
-        Ok(bytes) => Ok(bytes),
-        Err(error) => {
-            // 探测说支持 Range、实际分段却失败了（镜像前后不一致）：退回单连接再试一次，
-            // 别因为一次抖动把整条通道判死。
-            eprintln!("[更新] 分段下载失败（{error}），改用单连接重试");
-            download_stream(&client, url, Some(total), &progress).await
+    let bytes = match total {
+        Some(total) if probe.ranged && total >= MIN_SEGMENT_BYTES => {
+            match download_segmented(&client, url, total, control, &progress).await {
+                Ok(bytes) => bytes,
+                // 取消 / 停滞是控制类失败：再退回单连接等于把用户刚点的取消又拖回去。
+                Err(error) if is_control_error(&error) => return Err(error),
+                Err(error) => {
+                    // 探测说支持 Range、实际分段却失败了（镜像前后不一致）：退回单连接再试一次，
+                    // 别因为一次抖动把整条通道判死。
+                    eprintln!("[更新] 分段下载失败（{error}），改用单连接重试");
+                    control.reset_progress();
+                    download_stream(&client, url, Some(total), control, &progress).await?
+                }
+            }
         }
-    }
+        _ => download_stream(&client, url, total, control, &progress).await?,
+    };
+    // 收尾再查一次：用户可能在最后一块之后才点的取消。
+    control.check()?;
+    Ok(bytes)
 }
 
 async fn download_segmented(
     client: &reqwest::Client,
     url: &str,
     total: u64,
+    control: &Arc<DownloadControl>,
     progress: &Progress,
 ) -> Result<Vec<u8>, String> {
-    let downloaded = Arc::new(AtomicU64::new(0));
     let mut tasks = tokio::task::JoinSet::new();
     for (index, (start, end)) in plan_segments(total, SEGMENT_CONNECTIONS).into_iter().enumerate()
     {
         let client = client.clone();
         let url = url.to_string();
-        let downloaded = Arc::clone(&downloaded);
         let progress = Arc::clone(progress);
+        // 分段任务必须看见同一份控制块：取消 / 停滞要立刻砸掉全部 N 条连接。
+        let control = Arc::clone(control);
         tasks.spawn(async move {
-            download_range(&client, &url, (start, end), total, &downloaded, &progress)
+            download_range(&client, &url, (start, end), total, &control, &progress)
                 .await
                 .map(|bytes| (index, bytes))
         });
@@ -345,8 +495,16 @@ async fn download_segmented(
 
     let mut parts: Vec<(usize, Vec<u8>)> = Vec::new();
     while let Some(joined) = tasks.join_next().await {
-        let (index, bytes) =
-            joined.map_err(|error| format!("分段下载任务异常退出：{error}"))??;
+        let (index, bytes) = match joined {
+            Ok(Ok(part)) => part,
+            Ok(Err(error)) if is_control_error(&error) => {
+                // 一段被取消 / 判涓流就立刻放弃其余连接，别让 3 条死连接继续拖着。
+                tasks.abort_all();
+                return Err(error);
+            }
+            Ok(Err(error)) => return Err(error),
+            Err(error) => return Err(format!("分段下载任务异常退出：{error}")),
+        };
         parts.push((index, bytes));
     }
     parts.sort_by_key(|(index, _)| *index);
@@ -369,18 +527,21 @@ async fn download_range(
     url: &str,
     (start, end): (u64, u64),
     total: u64,
-    downloaded: &AtomicU64,
+    control: &DownloadControl,
     progress: &Progress,
 ) -> Result<Vec<u8>, String> {
     let mut last_error = String::new();
     for attempt in 0..=SEGMENT_RETRIES {
         let mut counted = 0u64;
-        match stream_range(client, url, start, end, total, downloaded, &mut counted, progress).await
-        {
+        match stream_range(client, url, start, end, total, control, &mut counted, progress).await {
             Ok(bytes) => return Ok(bytes),
             Err(error) => {
                 // 这一段已计入的字节要退回，否则重试后进度会虚高。
-                downloaded.fetch_sub(counted, Ordering::Relaxed);
+                control.release_bytes(counted);
+                // 取消 / 停滞不重试：用户已经点了取消，或这条通道已被判涓流，重试只是拖延换源。
+                if is_control_error(&error) {
+                    return Err(error);
+                }
                 last_error = error;
             }
         }
@@ -398,10 +559,11 @@ async fn stream_range(
     start: u64,
     end: u64,
     total: u64,
-    downloaded: &AtomicU64,
+    control: &DownloadControl,
     counted: &mut u64,
     progress: &Progress,
 ) -> Result<Vec<u8>, String> {
+    control.check()?;
     let response = client
         .get(url)
         .header(reqwest::header::RANGE, format!("bytes={start}-{end}"))
@@ -416,12 +578,11 @@ async fn stream_range(
     }
     let expected = end - start + 1;
     let mut buffer = Vec::with_capacity(expected as usize);
-    for_each_chunk(response, |chunk| {
+    for_each_chunk(response, control, |chunk| {
         buffer.extend_from_slice(&chunk[..]);
         *counted += chunk.len() as u64;
-        let done = downloaded.fetch_add(chunk.len() as u64, Ordering::Relaxed)
-            + chunk.len() as u64;
-        progress(done, Some(total));
+        control.record_bytes(chunk.len() as u64);
+        progress(control.downloaded(), Some(total));
     })
     .await?;
     if buffer.len() as u64 != expected {
@@ -437,8 +598,10 @@ async fn download_stream(
     client: &reqwest::Client,
     url: &str,
     total: Option<u64>,
+    control: &DownloadControl,
     progress: &Progress,
 ) -> Result<Vec<u8>, String> {
+    control.check()?;
     let response = client
         .get(url)
         .send()
@@ -449,12 +612,11 @@ async fn download_stream(
         return Err(format!("返回 HTTP {}", status.as_u16()));
     }
     let total = total.or_else(|| response.content_length());
-    let mut downloaded = 0u64;
     let mut buffer = Vec::with_capacity(total.unwrap_or_default() as usize);
-    for_each_chunk(response, |chunk| {
+    for_each_chunk(response, control, |chunk| {
         buffer.extend_from_slice(&chunk[..]);
-        downloaded += chunk.len() as u64;
-        progress(downloaded, total);
+        control.record_bytes(chunk.len() as u64);
+        progress(control.downloaded(), total);
     })
     .await?;
     if let Some(total) = total {
@@ -468,20 +630,32 @@ async fn download_stream(
     Ok(buffer)
 }
 
-/// 逐块读取响应体，每块都套一层空闲超时。
+/// 逐块读取响应体，每 500ms 一个检查点。
 ///
-/// 用 `timeout(IDLE_TIMEOUT, response.chunk())` 而不是给整个请求设总超时：慢速但仍在
-/// 出数据的线路不该被杀，只有「连着 20 秒一个字都没收到」才算死。
+/// 为什么不再直接 `timeout(IDLE_TIMEOUT, chunk())`：那样在整个等待期间都是不可打断的，
+/// 用户点「取消」得等满 20 秒才生效。改成 `timeout(CANCEL_POLL, chunk())` 轮询后：
+/// 每轮先看取消 / 停滞标志（响应上界 500ms），拿到块就重置空闲计时，
+/// 连续无字节累计到 `IDLE_TIMEOUT` 才报空闲超时 —— 语义与原来一致，只是可打断。
 async fn for_each_chunk(
     mut response: reqwest::Response,
+    control: &DownloadControl,
     mut on_chunk: impl FnMut(&[u8]),
 ) -> Result<(), String> {
+    let mut idle_deadline = Instant::now() + IDLE_TIMEOUT;
     loop {
-        match tokio::time::timeout(IDLE_TIMEOUT, response.chunk()).await {
-            Err(_) => return Err("连接空闲超时（20 秒没有收到数据）".to_string()),
+        control.check()?;
+        match tokio::time::timeout(CANCEL_POLL, response.chunk()).await {
+            Err(_) if Instant::now() >= idle_deadline => {
+                return Err("连接空闲超时（20 秒没有收到数据）".to_string());
+            }
+            // 只是这一轮没等到数据：回到循环顶部重新看取消标志，不重置空闲计时。
+            Err(_) => {}
             Ok(Err(error)) => return Err(format!("传输中断：{}", describe(&error))),
             Ok(Ok(None)) => return Ok(()),
-            Ok(Ok(Some(chunk))) => on_chunk(&chunk),
+            Ok(Ok(Some(chunk))) => {
+                idle_deadline = Instant::now() + IDLE_TIMEOUT;
+                on_chunk(&chunk);
+            }
         }
     }
 }
@@ -591,6 +765,101 @@ mod tests {
         let error = verify_signature(b"payload", "not-base64!!", FIXTURE_PUBKEY)
             .expect_err("非法 base64 必须报错");
         assert!(error.contains("编码无效"), "{error}");
+    }
+
+    // ---------------------------------------------------------------------
+    // 涓流判据（[D1]）：16.7 KB/s 的限速镜像必须判死，300 KB/s 的正常镜像不许误杀
+    // ---------------------------------------------------------------------
+
+    /// 实测限速源：15 秒窗口里恒定 16 KB/s —— 就是「卡在 85% 再也不动」的那种通道。
+    #[test]
+    fn 窗口判据_每秒十六kb的限速通道判涓流() {
+        let window = STALL_WINDOW;
+        let bytes = 16 * 1024 * window.as_secs();
+        assert!(throughput_is_stalled(window, bytes, Some(9_072_340)));
+    }
+
+    /// 实测正常源：15 秒窗口里恒定 300 KB/s —— 误判会把好通道也换掉，比卡住更糟。
+    #[test]
+    fn 窗口判据_每秒三百kb的正常通道不判涓流() {
+        let window = STALL_WINDOW;
+        let bytes = 300 * 1024 * window.as_secs();
+        assert!(!throughput_is_stalled(window, bytes, Some(9_072_340)));
+    }
+
+    /// 边界③：总长未知时不判 —— 无法排除「正常慢速的小文件」，只受候选预算约束。
+    #[test]
+    fn 窗口判据_总长未知时不判涓流() {
+        assert!(!throughput_is_stalled(STALL_WINDOW, 0, None));
+        assert!(!throughput_is_stalled(Duration::from_secs(60), 0, None));
+    }
+
+    /// 边界①：已下满（100%）之后速度归零是正常收尾，不能判涓流。
+    #[test]
+    fn 窗口判据_已下满百分之百时不判涓流() {
+        let total = 9_072_340;
+        assert!(!throughput_is_stalled(STALL_WINDOW, total, Some(total)));
+        assert!(!throughput_is_stalled(STALL_WINDOW, total + 1, Some(total)));
+    }
+
+    /// 边界②：前 5 秒是建链与首包，一律不判；跨过预热期立刻按地板判。
+    #[test]
+    fn 窗口判据_预热五秒内不判_跨过预热立刻判() {
+        let total = Some(9_072_340);
+        assert!(!throughput_is_stalled(
+            STALL_WARMUP - Duration::from_millis(1),
+            0,
+            total
+        ));
+        assert!(throughput_is_stalled(STALL_WARMUP, 0, total));
+    }
+
+    /// 检查点（[D7]）：取消 / 停滞置位后必须立刻返回对应文案，且能被精确识别为控制类失败。
+    #[test]
+    fn 检查点_取消与停滞置位后返回对应文案() {
+        let control = DownloadControl::new();
+        assert!(control.check().is_ok(), "刚创建的下载不该被拦");
+
+        control.stall("窗口吞吐 16 KB/s 低于 80 KB/s 地板");
+        assert!(control.is_stalled());
+        let error = control.check().expect_err("停滞必须拦住下载");
+        assert_eq!(error, STALLED_ERROR);
+        assert!(is_control_error(&error), "停滞属于控制类失败，不许重试");
+
+        control.cancel();
+        assert!(control.is_cancelled());
+        let error = control.check().expect_err("取消优先级最高");
+        assert_eq!(error, CANCELLED_ERROR);
+        assert!(is_control_error(&error), "取消属于控制类失败，不许重试");
+    }
+
+    /// 取消幂等，且不能抹掉累计字节（宿主还要拿它算进度）；换源前必须能归零。
+    #[test]
+    fn 控制块_取消幂等且累计字节可回退可归零() {
+        let control = DownloadControl::new();
+        control.record_bytes(1024);
+        control.record_bytes(1024);
+        control.release_bytes(24);
+        assert_eq!(control.downloaded(), 2024);
+        control.cancel();
+        control.cancel();
+        assert!(control.is_cancelled());
+        assert_eq!(control.downloaded(), 2024, "取消不该清空已下载字节");
+        control.reset_progress();
+        assert_eq!(control.downloaded(), 0, "换源前进度必须能归零");
+    }
+
+    /// 已取消的控制块：在 `send()` 之前就被拦住，连探测请求都不该发出去。
+    #[tokio::test]
+    async fn 已取消的控制块_发起下载立即返回已取消() {
+        let control = Arc::new(DownloadControl::new());
+        control.cancel();
+        let progress: Progress = Arc::new(|_, _| {});
+        // 指向必然连不通的地址：真发请求会等建连超时，只有前置检查才能立刻失败。
+        let error = fetch("http://127.0.0.1:1/a.exe", None, &control, progress)
+            .await
+            .expect_err("取消后不该继续下载");
+        assert_eq!(error, CANCELLED_ERROR);
     }
 
     // ---------------------------------------------------------------------
@@ -761,7 +1030,8 @@ mod tests {
             .collect();
         let server = RangeServer::start(body.clone(), RangeMode::Honest);
         let progress: Progress = Arc::new(|_, _| {});
-        let downloaded = fetch(&server.url(), None, progress)
+        let control = Arc::new(DownloadControl::new());
+        let downloaded = fetch(&server.url(), None, &control, progress)
             .await
             .expect("分段下载失败");
         assert_eq!(downloaded, body, "拼装结果必须与原始字节完全一致");
@@ -779,7 +1049,8 @@ mod tests {
             .collect();
         let server = RangeServer::start(body.clone(), RangeMode::Ignore);
         let progress: Progress = Arc::new(|_, _| {});
-        let downloaded = fetch(&server.url(), None, progress)
+        let control = Arc::new(DownloadControl::new());
+        let downloaded = fetch(&server.url(), None, &control, progress)
             .await
             .expect("整包下载失败");
         assert_eq!(downloaded, body);
@@ -795,7 +1066,8 @@ mod tests {
             .collect();
         let server = RangeServer::start(body.clone(), RangeMode::ProbeOnly);
         let progress: Progress = Arc::new(|_, _| {});
-        let downloaded = fetch(&server.url(), None, progress)
+        let control = Arc::new(DownloadControl::new());
+        let downloaded = fetch(&server.url(), None, &control, progress)
             .await
             .expect("分段失败后应该退回单连接");
         assert_eq!(downloaded, body);
@@ -827,7 +1099,8 @@ mod tests {
             std::env::set_var(key, "http://127.0.0.1:1");
         }
         let progress: Progress = Arc::new(|_, _| {});
-        let result = fetch(url, None, progress).await;
+        let control = Arc::new(DownloadControl::new());
+        let result = fetch(url, None, &control, progress).await;
         for (key, value) in previous {
             match value {
                 Some(value) => std::env::set_var(key, value),
