@@ -906,6 +906,10 @@ mod tests {
         should_keep_tray_alive, should_wake_main_window, tray_icon, tray_icon_variant, MouseButton,
         MouseButtonState, TrayIconVariant,
     };
+    // 单独一条并带 cfg：函数本体是 `#[cfg(windows)]`，塞进上面的共用列表会让
+    // macOS 构建直接 E0432 未解析导入（本仓三端共用一份 tray.rs）。
+    #[cfg(windows)]
+    use super::taskbar_uses_light_theme;
     use serde_json::json;
 
     #[test]
