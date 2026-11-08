@@ -911,7 +911,8 @@ async fn maybe_daily_chat(accounts: &[Value], cfg: &Value) -> Option<Value> {
     if targets.is_empty() {
         return None;
     }
-    Some(crate::modules::daily_chat::ensure_sent_today(targets).await)
+    // 编译占位：t2 会把这里换成从配置读出的 `chat_after_hour`（0 = 不限时，保持旧行为）。
+    Some(crate::modules::daily_chat::ensure_sent_today(targets, 0).await)
 }
 
 /// 批量签到的逐账号结果行；被排除账号不 poll 操作，因此不会发起任何请求。

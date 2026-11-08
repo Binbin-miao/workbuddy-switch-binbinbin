@@ -6,7 +6,8 @@
 //!
 //! 三条硬约束：
 //! 1. **每号每天最多一条**：记录落 `daily_chat_logs.json`，重启后不会重复发、不重复烧额度；
-//! 2. **并发发**：账号之间同时发，不让十个号排成一队；
+//! 2. **串行 + 间隔**：账号之间隔 3~8 秒逐个发，且本地 9 点前整轮不发 —— 同一秒多号齐发
+//!    既点不亮活跃地图，也是最明显的自动化指纹（见 `spec-daily-chat-active-map.md`）；
 //! 3. **失败不影响签到**：对话失败只记一行，签到结果照原样返回。
 
 use std::path::PathBuf;
@@ -86,6 +87,23 @@ fn local_hour(now: i64) -> u32 {
     chrono::DateTime::from_timestamp_millis(now)
         .map(|dt| dt.with_timezone(&Local).hour())
         .unwrap_or(12)
+}
+
+/// 是否到了可以发「日常对话」的时刻。
+///
+/// `after_hour = 0` 表示不限制（旧行为，可一键关掉时间窗）；否则要求本地小时已过下界。
+/// 窗口**只有下界**：本地 0~8:59 不发，9:00 到午夜都发，跨过午夜再拦 —— 因为 8:00 之后
+/// UTC 才跨日，9:00~23:59 都落在安全区（spec [D1] 边界②）。
+pub fn should_chat_now(hour: u32, after_hour: u32) -> bool {
+    after_hour == 0 || hour >= after_hour
+}
+
+/// 账号之间的发送间隔（毫秒）：`3000 + fnv1a(key + day) % 5001` → 区间 [3000, 8000]。
+///
+/// 用哈希而非随机数：同一天、同一账号的间隔恒定，既让多账号不挤在同一毫秒，
+/// 又保证结果可复现（spec [D2]）。
+pub fn chat_gap_ms(key: &str, day: &str) -> u64 {
+    3000 + fnv1a(&format!("{key}{day}")) % 5001
 }
 
 /// 某个小时对应的候选词库（时段词 + 通用词）。
@@ -173,20 +191,79 @@ fn today_str() -> String {
     Local::now().format("%Y-%m-%d").to_string()
 }
 
+/// 成长域 base URL。主机名与上报通道共用一张表，不再多一处 `.cn` / `.ai` 分叉。
+fn growth_base(account: &Value) -> String {
+    format!(
+        "https://{}",
+        crate::modules::growth_auto::report_host(account)
+    )
+}
+
+/// 从 `/activity/growth/streak` 的响应里取连登天数。
+///
+/// `code != 0`、`data` / `streak.days` 缺失或不是整数一律 `Err`：回读只用于自证，
+/// 读不到就当「不知道」，绝不影响发送结果（spec [D3] 边界⑦）。
+fn parse_streak_days(resp: &Value) -> Result<i64, String> {
+    if let Some(code) = resp.get("code").and_then(Value::as_i64) {
+        if code != 0 {
+            let msg = resp
+                .get("msg")
+                .or_else(|| resp.get("message"))
+                .and_then(Value::as_str)
+                .unwrap_or("上游返回错误");
+            return Err(format!("{msg}（code {code}）"));
+        }
+    }
+    resp.get("data")
+        .and_then(|data| data.get("streak"))
+        .and_then(|streak| streak.get("days"))
+        .and_then(Value::as_i64)
+        .ok_or_else(|| "响应缺少 data.streak.days".to_string())
+}
+
+/// 读服务端连登天数：`GET {growth_base}/activity/growth/streak`。
+async fn read_streak_days(account: &Value) -> Result<i64, String> {
+    let url = format!("{}/activity/growth/streak", growth_base(account));
+    let headers = crate::modules::account::build_auth_headers(account);
+    let resp = crate::modules::config::http_request(&url, "GET", None, Some(&headers)).await;
+    parse_streak_days(&resp)
+}
+
+/// 回读自证三态：`new` 本次点亮、`same` 天数没变、`unknown` 回读失败。
+fn verify_state(before: Option<i64>, after: Option<i64>) -> &'static str {
+    match (before, after) {
+        (Some(before), Some(after)) if after > before => "new",
+        (Some(_), Some(_)) => "same",
+        _ => "unknown",
+    }
+}
+
 /// 给这批账号各发一条日常对话（每号每天最多一条）。
 ///
-/// `accounts` 由调用方先过滤好（国内版、未被排除）。返回汇总：
+/// `accounts` 由调用方先过滤好（国内版、未被排除）；`after_hour` 是本地发送下界小时
+/// （`0` = 不限时）。返回汇总：
 /// `{"sent": n, "skipped": m, "failed": k, "results": [...]}`。
-pub async fn ensure_sent_today(accounts: Vec<Value>) -> Value {
-    let empty = json!({"sent": 0, "skipped": 0, "failed": 0, "results": []});
+///
+/// shortcut: App 白天没运行 → 当天不会发（无法远程唤醒）。这是 [D1] 边界④ 的已知边界，
+/// 不试图用后台服务补，只保证「运行时一定发得对」。
+pub async fn ensure_sent_today(accounts: Vec<Value>, after_hour: u32) -> Value {
     if accounts.is_empty() {
-        return empty;
+        return json!({"sent": 0, "skipped": 0, "failed": 0, "results": []});
+    }
+    let now = now_ms();
+    let hour = local_hour(now);
+    // 时间窗拦截放在写日志、发请求之前：整轮跳过不是失败，留给当天后续轮次。
+    if !should_chat_now(hour, after_hour) {
+        return json!({
+            "sent": 0, "skipped": 0, "failed": 0, "results": [],
+            "reason": "before_chat_hour",
+            "hour": hour,
+        });
     }
     let Some(_guard) = RunFlagGuard::try_acquire(&CHAT_RUNNING) else {
         return json!({"sent": 0, "skipped": 0, "failed": 0, "results": [], "reason": "already_running"});
     };
 
-    let now = now_ms();
     let day = today_str();
     let rows = load_logs();
 
@@ -206,65 +283,68 @@ pub async fn ensure_sent_today(accounts: Vec<Value>) -> Value {
         return json!({"sent": 0, "skipped": skipped, "failed": 0, "results": []});
     }
 
-    // 并发发：账号之间同时开始，谁也不等谁。
+    // 串行发：账号之间留 3~8 秒间隔，避开「同一秒多号齐发」这种自动化指纹（spec [D2]）。
     //
-    // 每个任务先过一遍 `ensure_fresh_token`：签到路径刷新的是它的副本，这里拿到的可能
+    // 每个账号先过一遍 `ensure_fresh_token`：签到路径刷新的是它的副本，这里拿到的可能
     // 还是旧 token；不刷新的话，最需要补对话的那批账号反而会 401 失败。
     let cfg = crate::modules::config::load_checkin_config();
-    let mut tasks = tokio::task::JoinSet::new();
-    for (key, account, phrase) in pending {
-        let email = crate::modules::account::account_display_name(&account);
-        let cfg = cfg.clone();
-        tasks.spawn(async move {
-            let account = crate::modules::refresh::ensure_fresh_token(account, &cfg).await;
-            let outcome =
-                crate::modules::growth_tasks::chat_with_prompt(&account, phrase).await;
-            (key, email, phrase, outcome)
-        });
-    }
-
+    let last_index = pending.len().saturating_sub(1);
     let mut results: Vec<Value> = Vec::new();
     let mut sent = 0usize;
     let mut failed = 0usize;
     let mut new_rows: Vec<Value> = Vec::new();
-    while let Some(joined) = tasks.join_next().await {
-        let Ok((key, email, phrase, outcome)) = joined else {
-            failed += 1;
-            continue;
-        };
+
+    for (index, (key, account, phrase)) in pending.into_iter().enumerate() {
+        let email = crate::modules::account::account_display_name(&account);
+        let account = crate::modules::refresh::ensure_fresh_token(account, &cfg).await;
+        // 发前、发后各回读一次连登天数：只用于自证今天有没有点亮，不参与 `ok` 判定。
+        let days_before = read_streak_days(&account).await.ok();
+        let outcome = crate::modules::growth_tasks::chat_with_prompt(&account, phrase).await;
+        let days_after = read_streak_days(&account).await.ok();
+        let verify = verify_state(days_before, days_after);
+
+        let mut row = json!({
+            "ts": now_ms(),
+            "day": day,
+            "accountKey": key,
+            "email": email,
+            "phrase": phrase,
+            "daysBefore": days_before,
+            "daysAfter": days_after,
+            "verify": verify,
+        });
         match outcome {
             Ok((conversation_id, _request_id)) => {
                 sent += 1;
-                results.push(json!({"email": email, "phrase": phrase, "ok": true}));
-                new_rows.push(json!({
-                    "ts": now_ms(),
-                    "day": day,
-                    "accountKey": key,
-                    "email": email,
-                    "phrase": phrase,
-                    "ok": true,
-                    "conversationId": conversation_id,
+                results.push(json!({
+                    "email": email, "phrase": phrase, "ok": true,
+                    "verify": verify, "daysAfter": days_after,
                 }));
+                row["ok"] = json!(true);
+                row["conversationId"] = json!(conversation_id);
             }
             Err(error) => {
                 failed += 1;
-                results.push(json!({"email": email, "phrase": phrase, "ok": false, "error": error}));
+                results.push(json!({
+                    "email": email, "phrase": phrase, "ok": false, "error": error,
+                    "verify": verify, "daysAfter": days_after,
+                }));
                 // 失败也落盘（`ok: false`）：`sent_today` 只看成功记录，下一轮会自动重试，
                 // 但日志里能看到到底为什么没发出去。
-                new_rows.push(json!({
-                    "ts": now_ms(),
-                    "day": day,
-                    "accountKey": key,
-                    "email": email,
-                    "phrase": phrase,
-                    "ok": false,
-                    "error": error,
-                }));
+                row["ok"] = json!(false);
+                row["error"] = json!(error);
             }
+        }
+        new_rows.push(row);
+
+        // 最后一个账号之后不 sleep：间隔只为隔开相邻两次发送。
+        if index < last_index {
+            let gap = chat_gap_ms(&key, &day);
+            tokio::time::sleep(std::time::Duration::from_millis(gap)).await;
         }
     }
 
-    // 统一一次写入：并发任务各自写盘会互相覆盖。
+    // 统一一次写入：逐账号写盘会互相覆盖。
     let mut merged = prune_rows(load_logs(), &day);
     merged.append(&mut new_rows);
     let _ = std::fs::create_dir_all(store_dir());
@@ -370,8 +450,76 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let value = runtime.block_on(ensure_sent_today(Vec::new()));
+        let value = runtime.block_on(ensure_sent_today(Vec::new(), 0));
         assert_eq!(value["sent"], 0);
         assert_eq!(value["results"].as_array().map(Vec::len), Some(0));
+    }
+
+    /// [D1] 时间窗：`after_hour = 0` 退回旧行为（不限时），否则按本地小时判下界。
+    #[test]
+    fn should_chat_now_respects_floor_hour() {
+        assert!(!should_chat_now(8, 9));
+        assert!(should_chat_now(9, 9));
+        assert!(should_chat_now(23, 9));
+        assert!(should_chat_now(0, 0), "after_hour=0 时 0 点也要发");
+        assert!(should_chat_now(5, 0));
+    }
+
+    /// 窗口只有下界：`after_hour = 9` 时 0~8 点全不发、9~23 点全发，覆盖全部 24 小时。
+    #[test]
+    fn should_chat_now_covers_every_hour() {
+        for hour in 0..24 {
+            assert_eq!(should_chat_now(hour, 9), hour >= 9, "{hour} 点判断错误");
+        }
+    }
+
+    /// [D2] 间隔恒定落在 [3000, 8000] ms，同一天同一账号结果不变。
+    #[test]
+    fn chat_gap_stays_within_three_to_eight_seconds() {
+        for (key, day) in [
+            ("uid-1", "2026-11-08"),
+            ("uid-2", "2026-11-08"),
+            ("uid-3", "2026-11-09"),
+            ("user@example.com", "2026-11-09"),
+            ("", "2026-11-09"),
+        ] {
+            let gap = chat_gap_ms(key, day);
+            assert!((3000..=8000).contains(&gap), "{key}/{day} 间隔越界：{gap}");
+            assert_eq!(gap, chat_gap_ms(key, day), "{key}/{day} 两次结果不一致");
+        }
+    }
+
+    /// [D3] 回读只接受 `code == 0` + `data.streak.days` 整数，其余一律 Err（不 panic）。
+    #[test]
+    fn parse_streak_days_accepts_only_well_formed_payloads() {
+        assert_eq!(
+            parse_streak_days(&json!({"code": 0, "data": {"streak": {"days": 3}}})),
+            Ok(3)
+        );
+        assert_eq!(
+            parse_streak_days(&json!({"data": {"streak": {"days": 0}}})),
+            Ok(0),
+            "上游省略 code 时按成功处理（与 growth_tasks 同口径）"
+        );
+        for bad in [
+            json!({"code": 5, "message": "token 失效"}),
+            json!({"code": 0, "data": {}}),
+            json!({"code": 0, "data": {"streak": {}}}),
+            json!({"code": 0, "data": {"streak": {"days": "3"}}}),
+            json!({"code": -1, "message": "网络错误"}),
+        ] {
+            assert!(parse_streak_days(&bad).is_err(), "{bad} 应当报错");
+        }
+    }
+
+    /// [D3] 三态：只有回读变大才算点亮；变少也按 same（不谎报）。
+    #[test]
+    fn verify_state_reports_new_same_and_unknown() {
+        assert_eq!(verify_state(Some(0), Some(1)), "new");
+        assert_eq!(verify_state(Some(2), Some(2)), "same");
+        assert_eq!(verify_state(Some(3), Some(2)), "same");
+        assert_eq!(verify_state(None, Some(2)), "unknown");
+        assert_eq!(verify_state(Some(2), None), "unknown");
+        assert_eq!(verify_state(None, None), "unknown");
     }
 }
