@@ -302,6 +302,7 @@ pub fn run() {
             commands::check_update,
             commands::update_state,
             commands::update_download,
+            commands::update_cancel_download,
             commands::update_restart,
             commands::update_skip_version,
             commands::update_clear_skipped_version,

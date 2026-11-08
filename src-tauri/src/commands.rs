@@ -1486,6 +1486,15 @@ pub fn update_download(app: tauri::AppHandle) -> Result<(), String> {
     crate::update_service::start_download(&app)
 }
 
+/// POST /api/update/cancel —— 取消正在进行的更新包下载。
+///
+/// 幂等：没有下载在跑时返回 `Ok(())`，不报错、不改阶段（spec [D4] 边界④）。
+/// 取消不算失败：阶段回到「可升级」，用户可以直接再点一次下载。
+#[tauri::command]
+pub fn update_cancel_download() -> Result<(), String> {
+    crate::update_service::cancel_download()
+}
+
 /// POST /api/update/restart —— 安装已下载的更新包并重启应用。
 ///
 /// 安装时机在用户点「重启以完成升级」时：Windows 安装器要求应用退出才能完成安装，

@@ -12,8 +12,8 @@
 //! 安装。Windows NSIS 安装器要求应用退出后才能完成安装，下载即安装等于强制自动重启；
 //! macOS 安装可能触发 `/Applications` 写授权，放在用户主动动作时语义才自然。
 
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU32, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use serde::Serialize;
@@ -34,6 +34,10 @@ const BUSY_MESSAGE: &str = "更新任务正在进行中，请稍候";
 const NO_PACKAGE_MESSAGE: &str = "没有可安装的更新包，请先下载更新包";
 const DEMO_DOWNLOAD_MESSAGE: &str = "演示模式已跳过更新下载";
 const DEMO_RESTART_MESSAGE: &str = "演示模式已跳过更新安装";
+/// 用户取消下载后的提示文案（spec [D4] 边界⑤）。
+const CANCELLED_MESSAGE: &str = "已取消下载";
+/// 涓流采样节拍：1 秒一次，比 [D1] 的 15 秒窗口细得多，判定延迟 ≈ 窗口 + 1 秒。
+const STALL_SAMPLE: Duration = Duration::from_secs(1);
 
 /// 更新阶段。前端与托盘菜单都只读这一份状态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -143,6 +147,75 @@ impl Drop for BusyGuard {
     fn drop(&mut self) {
         BUSY.store(false, Ordering::Release);
     }
+}
+
+// ---------------------------------------------------------------------------
+// 下载控制块：取消 / 涓流标志的唯一宿主（core 只读它，宿主只写它）
+// ---------------------------------------------------------------------------
+
+/// 当前正在跑的下载控制块。取消命令靠它找到任务；任务结束必须清空，
+/// 否则用户下次点取消会打到一块早已结束的僵尸块上（阶段却不动，像点坏了）。
+static ACTIVE_CONTROL: OnceLock<Mutex<Option<Arc<update_download::DownloadControl>>>> =
+    OnceLock::new();
+
+fn active_control_cell() -> &'static Mutex<Option<Arc<update_download::DownloadControl>>> {
+    ACTIVE_CONTROL.get_or_init(|| Mutex::new(None))
+}
+
+/// 把控制块挂到全局槽位上，Drop 即清空。
+///
+/// 用 guard 而不是手写三次清理：成功 / 失败 / 取消三条路都要清，漏一条就是「取消打到僵尸块」。
+struct ActiveControlGuard;
+
+impl ActiveControlGuard {
+    fn install(control: Arc<update_download::DownloadControl>) -> Self {
+        *active_control_cell()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(control);
+        Self
+    }
+}
+
+impl Drop for ActiveControlGuard {
+    fn drop(&mut self) {
+        *active_control_cell()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+}
+
+/// 换候选通道：给下一条通道装一块干净的控制块。
+///
+/// 为什么必须换块：停滞标志是「**这条**通道涓流」的一次性判定，带进下一条会让
+/// `check()` 立刻返回「速度过低」，好通道连试都试不上。取消则是「**整条**任务结束」
+/// 的意图，必须跨候选保留 —— 所以整段持锁并与 [`cancel_download`] 互斥，取消不会落空。
+fn install_candidate_control(
+    previous: &Arc<update_download::DownloadControl>,
+) -> Arc<update_download::DownloadControl> {
+    let mut slot = active_control_cell()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let fresh = Arc::new(update_download::DownloadControl::new());
+    if previous.is_cancelled() {
+        fresh.cancel();
+    }
+    *slot = Some(Arc::clone(&fresh));
+    fresh
+}
+
+/// 取消当前下载：幂等 —— 没有任务在跑时返回 `Ok(())`，不报错、不改阶段（spec [D4] 边界④）。
+pub fn cancel_download() -> Result<(), String> {
+    let slot = active_control_cell()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(control) = slot.as_ref() else {
+        eprintln!("[更新] 取消下载：当前没有下载任务（幂等返回）");
+        return Ok(());
+    };
+    // 持锁置位：与「换候选」互斥，避免取消落在正被替换掉的旧控制块上。
+    control.cancel();
+    eprintln!("[更新] 取消下载：已通知当前通道中止，阶段将回到可升级");
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -281,6 +354,29 @@ fn fail(message: String) -> UpdateSnapshot {
     })
 }
 
+/// 用户取消：回到「可升级」并保留 `latest`，用户可以再点一次下载（spec [D4] 边界⑤）。
+///
+/// 取消**不算失败**：stage 不进 Error、不弹通知、不进退避（边界⑥），
+/// 否则用户手滑点一次取消就要等 30 分钟才有下一次自动下载。
+fn mark_cancelled() -> UpdateSnapshot {
+    MENU_PROGRESS_BUCKET.store(u8::MAX, Ordering::Release);
+    with_snapshot(|snapshot| {
+        snapshot.phase = UpdatePhase::Available;
+        snapshot.percent = None;
+        snapshot.message = Some(CANCELLED_MESSAGE.to_string());
+        snapshot.clone()
+    })
+}
+
+/// 换源时把进度打回 0 并广播：不能让前端停在上一通道留下的百分比（spec [D5]）。
+fn rewind_progress() -> UpdateSnapshot {
+    MENU_PROGRESS_BUCKET.store(0, Ordering::Release);
+    with_snapshot(|snapshot| {
+        snapshot.percent = Some(0);
+        snapshot.clone()
+    })
+}
+
 /// 下载进度换算：总量未知或为 0 → None；超出总量按 100 截断。
 fn percent_of(downloaded: u64, total: Option<u64>) -> Option<u8> {
     let total = total.filter(|total| *total > 0)?;
@@ -385,6 +481,13 @@ fn start_download_inner<R: Runtime>(app: &AppHandle<R>, auto: bool) -> Result<()
                     &app,
                     apply_check_result(&json!({"ok": true, "hasUpdate": false})),
                 );
+                reset_tooltip(&app);
+            }
+            // 用户主动取消：回到「可升级」，不计数、不通知、不进退避（spec [D4] 边界⑤⑥）。
+            // 必须排在通用失败分支之前，否则会被当成一次下载失败计入自动重试退避。
+            Err(message) if message == update_download::CANCELLED_ERROR => {
+                eprintln!("[更新] 下载已被用户取消，阶段回到可升级");
+                set_phase(&app, mark_cancelled());
                 reset_tooltip(&app);
             }
             Err(message) => {
@@ -571,13 +674,26 @@ async fn download_package<R: Runtime>(
     let pubkey = updater_pubkey(app)?;
     set_phase(app, begin_download(&version));
 
+    let control = Arc::new(update_download::DownloadControl::new());
+    // 挂上全局槽位：取消命令从这一刻起有效；成功 / 失败 / 取消都由 Drop 清空。
+    let _active = ActiveControlGuard::install(Arc::clone(&control));
+
+    // 整包大小由 core 在首个进度回调里给出（探测阶段才知道）；涓流判据需要它 ——
+    // total 未知就不判（spec [D1] 边界③）。0 表示「还不知道」，包大小不可能为 0。
+    let total = Arc::new(AtomicU64::new(0));
     let progress: update_download::Progress = {
         let app = app.clone();
-        std::sync::Arc::new(move |downloaded, total| {
-            on_download_chunk(&app, downloaded, total)
+        let total = Arc::clone(&total);
+        Arc::new(move |downloaded, total_bytes| {
+            if let Some(size) = total_bytes {
+                total.store(size, Ordering::Relaxed);
+            }
+            on_download_chunk(&app, downloaded, total_bytes)
         })
     };
-    let bytes = download_verified(&update, proxy.as_deref(), &pubkey, &progress).await?;
+    let bytes =
+        download_verified(app, &update, proxy.as_deref(), &pubkey, &control, &total, &progress)
+            .await?;
     Ok(Some(DownloadedPackage {
         version,
         bytes,
@@ -643,42 +759,153 @@ fn build_updater<R: Runtime>(
 /// 按 [`update_download::rank_candidates`] 的实测速度排序，依次尝试、每个都验签，
 /// 任一成功即返回；排序只是"先试谁"，不是跳过验签的理由。
 ///
+/// 三道闸门（spec [D1]/[D2]/[D3]）：
+/// - 单候选 `CANDIDATE_BUDGET`，到点换下一条；
+/// - 每秒采样窗口吞吐判涓流，判真即给控制块置停滞、core 在 500ms 内放弃这条通道；
+/// - 整段（测速 + 换源 + 验签）`DOWNLOAD_DEADLINE`，超时按 [D3] 文案收尾。
+///
+/// 涓流与超预算只换候选，**取消则终止整条任务**（[D4] 边界⑥）。
+///
 /// 镜像只负责「把字节搬快」，可信度由 `verify_signature` 兜底：任何一个镜像返回
 /// 脏数据或半截文件都会在这里被拒，然后自动换下一个通道。
-async fn download_verified(
+async fn download_verified<R: Runtime>(
+    app: &AppHandle<R>,
     update: &tauri_plugin_updater::Update,
     proxy: Option<&str>,
     pubkey: &str,
+    control: &Arc<update_download::DownloadControl>,
+    total: &Arc<AtomicU64>,
     progress: &update_download::Progress,
 ) -> Result<Vec<u8>, String> {
+    // 总预算从测速之前开始算：测速本身也要吃候选的 5 秒，不能让它游离在兜底之外。
+    let deadline = tokio::time::Instant::now() + update_download::DOWNLOAD_DEADLINE;
     let candidates = update_download::download_candidates(update.download_url.as_str());
     // 候选顺序不再写死：镜像与直连谁快完全取决于用户网络（实测过镜像 20 KB/s、
     // 代理直连 3.5 MB/s 的机器，也见过相反的）。按小样本实测速度重排，慢的沉底兜底。
     let candidates = update_download::rank_candidates(&candidates, proxy).await;
+    let mut current = Arc::clone(control);
     let mut failures: Vec<String> = Vec::new();
-    for candidate in candidates {
-        let label = source_label(&candidate);
-        eprintln!("[更新] 下载尝试：{label}");
-        match update_download::fetch(&candidate, proxy, std::sync::Arc::clone(progress)).await {
-            Ok(bytes) => {
-                match update_download::verify_signature(&bytes, &update.signature, pubkey) {
-                    Ok(()) => {
-                        eprintln!("[更新] 下载完成并验签通过：{label}（{} 字节）", bytes.len());
-                        return Ok(bytes);
-                    }
-                    Err(error) => {
-                        eprintln!("[更新] {label} 验签失败：{error}");
-                        failures.push(format!("{label}：{error}"));
-                    }
+    let mut timed_out = false;
+
+    for (index, candidate) in candidates.iter().enumerate() {
+        // 取消是「整条任务结束」：换源继续下载等于没取消。
+        if current.is_cancelled() {
+            return Err(update_download::CANCELLED_ERROR.to_string());
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            timed_out = true;
+            break;
+        }
+        let label = source_label(candidate);
+        if index == 0 {
+            eprintln!("[更新] 下载尝试：{label}");
+        } else {
+            eprintln!("[更新] 换源重试：{label}（已尝试 {index} 条通道）");
+            // 进度归零 + 停滞标志不复用 + 取消延续，三件事都在这里落地。
+            current = install_candidate_control(&current);
+            set_phase(app, rewind_progress());
+        }
+
+        let budget = remaining.min(update_download::CANDIDATE_BUDGET);
+        let sampler = spawn_stall_watch(Arc::clone(&current), Arc::clone(total));
+        let attempt = tokio::time::timeout(
+            budget,
+            update_download::fetch(candidate, proxy, &current, Arc::clone(progress)),
+        )
+        .await;
+        // 采样任务只活在这一条候选的生命期里，超时 / 提前返回都要停掉。
+        sampler.abort();
+
+        match attempt {
+            Ok(Ok(bytes)) => match update_download::verify_signature(&bytes, &update.signature, pubkey)
+            {
+                Ok(()) => {
+                    eprintln!(
+                        "[更新] 下载完成并验签通过：{label}（{} 字节）",
+                        bytes.len()
+                    );
+                    return Ok(bytes);
                 }
-            }
-            Err(error) => {
+                Err(error) => {
+                    eprintln!("[更新] {label} 验签失败：{error}");
+                    failures.push(format!("{label}：{error}"));
+                }
+            },
+            // 取消直接上抛：让 start_download_inner 走「回到可升级」分支，而不是当失败重试。
+            Ok(Err(error)) if error == update_download::CANCELLED_ERROR => return Err(error),
+            Ok(Err(error)) => {
                 eprintln!("[更新] {label} 下载失败：{error}");
                 failures.push(format!("{label}：{error}"));
             }
+            // 预算到点：整段下载也到期了就直接收尾，否则只记这一条通道超预算。
+            Err(_) if tokio::time::Instant::now() >= deadline => {
+                failures.push(format!("{label}：预算耗尽"));
+                timed_out = true;
+                break;
+            }
+            Err(_) => {
+                eprintln!(
+                    "[更新] {label} 超出单候选预算（{} 秒），换下一个候选",
+                    budget.as_secs()
+                );
+                failures.push(format!("{label}：{} 秒内没下完", budget.as_secs()));
+            }
         }
     }
+
+    if timed_out {
+        eprintln!(
+            "[更新] 下载超时（6 分钟），各通道失败原因：{}",
+            failures.join("；")
+        );
+        // 文案按 spec [D3]：说清试过几条通道，用户才知道不是卡死，也知道还能重试。
+        return Err(format!(
+            "下载超时（6 分钟），已尝试 {} 条通道",
+            failures.len()
+        ));
+    }
     Err(format!("所有下载通道都失败了（{}）", failures.join("；")))
+}
+
+/// 每秒量一次窗口吞吐：低于地板就给控制块置停滞，core 在 500ms 内放弃这条通道。
+///
+/// `bytes` 传窗口内的**增量**而不是累计量：整段均速会被前一段的快跑掩盖，
+/// 用户看到的「卡在 85% 再也不动」正是后段涓流，只有窗口增量判得出来。
+fn spawn_stall_watch(
+    control: Arc<update_download::DownloadControl>,
+    total: Arc<AtomicU64>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut window_started = std::time::Instant::now();
+        let mut window_bytes = control.downloaded();
+        loop {
+            tokio::time::sleep(STALL_SAMPLE).await;
+            let elapsed = window_started.elapsed();
+            // 不足一个窗口就没有判据（[D1] 边界②的预热期也自然被覆盖）。
+            if elapsed < update_download::STALL_WINDOW {
+                continue;
+            }
+            let downloaded = control.downloaded();
+            let window_bytes_now = downloaded.saturating_sub(window_bytes);
+            // 0 是「总量还不知道」的哨兵：未知就不判涓流（[D1] 边界③）。
+            let known_total = match total.load(Ordering::Relaxed) {
+                0 => None,
+                size => Some(size),
+            };
+            if update_download::throughput_is_stalled(elapsed, window_bytes_now, known_total) {
+                let throughput = window_bytes_now / elapsed.as_secs().max(1) / 1024;
+                control.stall(&format!(
+                    "窗口 {} 秒只下了 {window_bytes_now} 字节（约 {throughput} KB/s，累计 {downloaded} 字节），低于 80 KB/s 地板",
+                    elapsed.as_secs()
+                ));
+                return;
+            }
+            // 滑动窗口：判完把窗口起点挪到此刻，下一轮只看新的 15 秒。
+            window_started = std::time::Instant::now();
+            window_bytes = downloaded;
+        }
+    })
 }
 
 /// 下载通道的人类可读标签，用于日志与失败文案。
@@ -1061,5 +1288,78 @@ mod tests {
     fn download_tooltip_reports_percent_or_unknown() {
         assert_eq!(download_tooltip(Some(42)), "正在下载更新 42%");
         assert_eq!(download_tooltip(None), "正在下载更新…");
+    }
+
+    // ---------------------------------------------------------------------
+    // 取消下载（spec [D4]）：幂等、阶段回退、控制块槽位生命周期
+    // ---------------------------------------------------------------------
+
+    fn clear_active_control() {
+        *active_control_cell()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+
+    /// 边界④：没有下载在跑时点取消必须返回 Ok（前端按钮可能被连点），且不改阶段。
+    #[test]
+    fn 取消下载_没有任务时幂等返回_ok() {
+        let _guard = lock();
+        reset();
+        clear_active_control();
+        assert!(cancel_download().is_ok());
+        assert!(cancel_download().is_ok(), "重复取消也必须 Ok");
+        assert_eq!(snapshot().phase, UpdatePhase::Idle, "无任务时取消不改阶段");
+    }
+
+    /// 有任务在跑时取消要真的置位；任务结束（guard drop）必须清空全局槽位。
+    #[test]
+    fn 取消下载_置位当前控制块且结束后清空槽位() {
+        let _guard = lock();
+        reset();
+        let control = Arc::new(update_download::DownloadControl::new());
+        let active = ActiveControlGuard::install(Arc::clone(&control));
+        assert!(cancel_download().is_ok());
+        assert!(control.is_cancelled(), "取消必须落到当前控制块上");
+        drop(active);
+        let slot = active_control_cell()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(slot.is_none(), "任务结束必须清空全局槽位，否则下次取消打到僵尸块");
+    }
+
+    /// 边界⑤：取消后回到「可升级」并保留 latest，percent 必须清空，提示文案是「已取消下载」。
+    #[test]
+    fn 取消后阶段回到可升级且百分比清空() {
+        let _guard = lock();
+        reset();
+        apply_check_result(&json!({"ok": true, "latest": "9.9.9", "hasUpdate": true}));
+        begin_download("9.9.9");
+        assert_eq!(advance_progress(85, Some(100)), Some(85));
+        let snapshot = mark_cancelled();
+        assert_eq!(snapshot.phase, UpdatePhase::Available);
+        assert_eq!(snapshot.latest.as_deref(), Some("9.9.9"));
+        assert_eq!(snapshot.percent, None);
+        assert_eq!(snapshot.message.as_deref(), Some("已取消下载"));
+    }
+
+    /// 换候选：停滞标志（单通道判定）必须清掉，取消意图必须带进下一条通道。
+    #[test]
+    fn 换候选清空停滞标志但保留取消意图() {
+        let _guard = lock();
+        reset();
+        clear_active_control();
+        let first = Arc::new(update_download::DownloadControl::new());
+        let _active = ActiveControlGuard::install(Arc::clone(&first));
+        first.stall("窗口吞吐 16 KB/s 低于地板");
+        assert_eq!(first.check().expect_err("停滞必须拦住"), update_download::STALLED_ERROR);
+
+        let second = install_candidate_control(&first);
+        assert!(!second.is_stalled(), "停滞是单通道判定，不能带进下一条通道");
+        assert!(second.check().is_ok(), "新通道必须能真的开工");
+
+        second.cancel();
+        let third = install_candidate_control(&second);
+        assert!(third.is_cancelled(), "取消是整条任务的意图，必须跨候选保留");
+        drop(_active);
     }
 }
