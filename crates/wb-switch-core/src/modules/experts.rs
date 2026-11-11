@@ -13,6 +13,9 @@
 //!    都只把该账号记成一条错误并跳过写入。静默丢弃不认识的元素，写回时就会删掉用户数据。
 //! 3. **内容一致不写**：比较**解析后的去重集合**而不是字节。App 可能按插入顺序写这份清单，
 //!    比字节会让每次切号都重写、都留一份备份。
+//! 4. **整份覆盖（镜像用）是独立原语，与合并互不替代**：`overwrite_from_mother_at` 用母本原文
+//!    替换目标清单（目标独有的名字会被移除），三条铁律照样生效——先备份再覆盖、非法内容一字
+//!    不动、集合一致不写。两者不共用实现，也不互相调用。
 //!
 //! 不参与同步的东西：`storage/user-<uid>-personal/global/expert.json` 是「最近使用」历史，
 //! `scoped/<hash>/expert-picker.json` 是置顶状态——两者都是使用痕迹，同步过去等于伪造记录。
@@ -176,7 +179,12 @@ fn read_experts_at(root: &Path, uid: &str) -> Result<Option<Vec<String>>, String
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(format!("读取 {EXPERTS_FILE} 失败：{error}")),
     };
-    let value: Value = serde_json::from_str(&text)
+    parse_experts_text(&text).map(Some)
+}
+
+/// 解析一份清单文本：顶层必须是字符串数组，混入非字符串元素即整份不可信。
+fn parse_experts_text(text: &str) -> Result<Vec<String>, String> {
+    let value: Value = serde_json::from_str(text)
         .map_err(|error| format!("{EXPERTS_FILE} 不是合法 JSON，已跳过该账号：{error}"))?;
     let Value::Array(items) = value else {
         return Err(format!(
@@ -194,7 +202,7 @@ fn read_experts_at(root: &Path, uid: &str) -> Result<Option<Vec<String>>, String
             }
         }
     }
-    Ok(Some(names))
+    Ok(names)
 }
 
 /// 幂等判定：比的是**去重后的集合**，不看顺序、缩进与重复项。
@@ -211,6 +219,139 @@ fn backup_path(path: &Path) -> PathBuf {
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| EXPERTS_FILE.to_string());
     path.with_file_name(format!("{name}.bak-{}", now_ms()))
+}
+
+// ---------------------------------------------------------------------------
+// 整份覆盖（镜像切换用）：母本原文替换目标清单，与并集合并互不替代
+// ---------------------------------------------------------------------------
+
+/// 母本没有可覆盖的清单时给界面的跳过文案（不是错误）。
+const NOTE_MOTHER_EMPTY: &str = "母本未添加专家团";
+
+/// 覆盖判定结果：`requires_write = false` 表示本次无需写入（母本无清单 / 集合已一致）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpertsPlan {
+    /// 是否值得写：两侧都可读且集合不同。
+    pub requires_write: bool,
+    /// 跳过原因（供界面回显）；需要写入时为 `None`。
+    pub note: Option<String>,
+    /// 母本当前的专家团名字，供界面逐条复核；母本无清单时为空。
+    pub mother_names: Vec<String>,
+}
+
+/// 覆盖无法进行的错误：任一侧内容不可信就整份放弃（模块铁律 2）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExpertsBlock {
+    /// 母本清单不可读 / 非法：不写目标。
+    MotherInvalid(String),
+    /// 目标清单不可信，或目标侧写入（建目录 / 备份 / 落盘）失败：不覆盖。
+    TargetInvalid(String),
+}
+
+impl ExpertsBlock {
+    /// 折进 `MirrorReport.errors` 或预览 `expertsNote` 的文案。
+    pub fn message(&self) -> &str {
+        match self {
+            Self::MotherInvalid(message) | Self::TargetInvalid(message) => message,
+        }
+    }
+}
+
+impl ExpertsPlan {
+    fn skip(note: &str) -> Self {
+        Self {
+            requires_write: false,
+            note: Some(note.to_string()),
+            mother_names: Vec::new(),
+        }
+    }
+}
+
+/// 是否值得把母本清单整份覆盖到目标账号（预览与执行共用同一判定，避免两处漂移）。
+///
+/// 良性跳过（母本无清单 / 集合一致）走 `Ok`，只有内容不可信才走 `Err`——跳过不是错误。
+pub fn plan_overwrite_at(
+    root: &Path,
+    mother_uid: &str,
+    target_uid: &str,
+) -> Result<ExpertsPlan, ExpertsBlock> {
+    let Some(mother_names) = read_experts_at(root, mother_uid).map_err(ExpertsBlock::MotherInvalid)?
+    else {
+        return Ok(ExpertsPlan::skip(NOTE_MOTHER_EMPTY));
+    };
+    if mother_names.is_empty() {
+        return Ok(ExpertsPlan::skip(NOTE_MOTHER_EMPTY));
+    }
+    let target = read_experts_at(root, target_uid).map_err(ExpertsBlock::TargetInvalid)?;
+    let requires_write = target
+        .as_deref()
+        .is_none_or(|existing| !same_name_set(existing, &mother_names));
+    Ok(ExpertsPlan {
+        requires_write,
+        note: None,
+        mother_names,
+    })
+}
+
+/// 整份覆盖的结果：`backup` 是覆盖前目标原文的备份路径（原本没有清单时为 `None`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpertsOutcome {
+    pub written: bool,
+    pub backup: Option<String>,
+    /// 覆盖前目标是否已有清单（`false` = 目录新建 / 无原文可留）。
+    pub had_content: bool,
+}
+
+/// 用母本清单的**原文**整份替换目标清单，覆盖前先把目标原文备份到 `backup_file`。
+///
+/// 顺序不可颠倒：建目录 → 备份成功 → 才 `atomic_write`。备份失败即放弃覆盖，
+/// 否则用户原有的清单不可恢复（模块铁律 1）。母本侧任何分支都只读。
+pub fn overwrite_from_mother_at(
+    root: &Path,
+    mother_uid: &str,
+    target_uid: &str,
+    backup_file: &Path,
+) -> Result<ExpertsOutcome, ExpertsBlock> {
+    let plan = plan_overwrite_at(root, mother_uid, target_uid)?;
+    let target_dir = custom_dir_at(root, target_uid);
+    let target_path = target_dir.join(EXPERTS_FILE);
+    if !plan.requires_write {
+        return Ok(ExpertsOutcome {
+            written: false,
+            backup: None,
+            had_content: target_path.is_file(),
+        });
+    }
+    // 原文照抄：重排会让「原文备份 → 还原」失去字节级对称，也让顺序同母本不一致。
+    let content = std::fs::read_to_string(custom_dir_at(root, mother_uid).join(EXPERTS_FILE))
+        .map_err(|error| ExpertsBlock::MotherInvalid(format!("读取母本 {EXPERTS_FILE} 失败：{error}")))?;
+    std::fs::create_dir_all(&target_dir)
+        .map_err(|error| ExpertsBlock::TargetInvalid(format!("创建专家目录失败：{error}")))?;
+    let had_content = target_path.is_file();
+    let backup = if had_content {
+        match std::fs::copy(&target_path, backup_file) {
+            Ok(_) => Some(backup_file.to_string_lossy().to_string()),
+            Err(error) => {
+                return Err(ExpertsBlock::TargetInvalid(format!(
+                    "备份 {EXPERTS_FILE} 失败，已放弃覆盖：{error}"
+                )))
+            }
+        }
+    } else {
+        None
+    };
+    atomic_write(&target_path, &content)
+        .map_err(|error| ExpertsBlock::TargetInvalid(format!("写入 {EXPERTS_FILE} 失败：{error}")))?;
+    Ok(ExpertsOutcome {
+        written: true,
+        backup,
+        had_content,
+    })
+}
+
+/// 两侧名字列表的去重集合是否一致（顺序、缩进、重复项都不算变化）。
+fn same_name_set(a: &[String], b: &[String]) -> bool {
+    a.iter().collect::<BTreeSet<&String>>() == b.iter().collect::<BTreeSet<&String>>()
 }
 
 #[cfg(test)]
@@ -577,6 +718,196 @@ mod tests {
         assert!(report["note"].is_string(), "{report}");
         assert_eq!(dir.read("a").unwrap(), "[]");
         assert_eq!(dir.read("b").unwrap(), "[ ]");
+    }
+
+    // -----------------------------------------------------------------------
+    // 整份覆盖（镜像用）：与并集合并是两种原语，互不替代
+    // -----------------------------------------------------------------------
+
+    /// 覆盖用的备份目标：模拟镜像的 `{transaction_dir}/{opId}/experts-backup.json`。
+    fn backup_file(dir: &TempDir) -> PathBuf {
+        let path = dir
+            .path()
+            .join("transactions")
+            .join("op1")
+            .join("experts-backup.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        path
+    }
+
+    #[test]
+    fn overwrite_copies_mother_bytes_and_keeps_order() {
+        let dir = TempDir::new("overwrite-bytes");
+        // 母本故意用非排序顺序：覆盖必须逐字节照抄，不得重排成排序后的形态。
+        let mother_text = "[\n  \"zeta-expert\",\n  \"alpha-expert\"\n]";
+        dir.write_raw("mother", mother_text);
+        dir.write_list("target", &["old-expert"]);
+
+        let outcome =
+            overwrite_from_mother_at(dir.path(), "mother", "target", &backup_file(&dir)).unwrap();
+
+        assert!(outcome.written);
+        assert_eq!(dir.read("target").unwrap(), mother_text, "顺序与字节同母本");
+    }
+
+    #[test]
+    fn missing_mother_does_not_empty_target() {
+        let dir = TempDir::new("missing-mother");
+        let original = "[\"keep-me\"]";
+        dir.write_raw("target", original);
+
+        let plan = plan_overwrite_at(dir.path(), "mother", "target").unwrap();
+        assert!(!plan.requires_write);
+        assert_eq!(plan.note.as_deref(), Some("母本未添加专家团"));
+        assert!(plan.mother_names.is_empty());
+
+        let backup = backup_file(&dir);
+        let outcome = overwrite_from_mother_at(dir.path(), "mother", "target", &backup).unwrap();
+        assert!(!outcome.written);
+        assert_eq!(dir.read("target").unwrap(), original, "目标不得被清空");
+        assert!(!backup.exists(), "无需写入时不该产生备份");
+    }
+
+    #[test]
+    fn empty_mother_is_skipped() {
+        let dir = TempDir::new("empty-mother");
+        dir.write_raw("mother", "[]");
+        let original = "[\"keep-me\"]";
+        dir.write_raw("target", original);
+
+        let plan = plan_overwrite_at(dir.path(), "mother", "target").unwrap();
+        assert!(!plan.requires_write);
+        assert_eq!(plan.note.as_deref(), Some("母本未添加专家团"));
+
+        let backup = backup_file(&dir);
+        let outcome = overwrite_from_mother_at(dir.path(), "mother", "target", &backup).unwrap();
+        assert!(!outcome.written);
+        assert_eq!(dir.read("target").unwrap(), original, "空母本不得清空目标");
+        assert!(!backup.exists());
+    }
+
+    #[test]
+    fn invalid_mother_json_is_reported_and_target_untouched() {
+        let dir = TempDir::new("bad-mother");
+        dir.write_raw("mother", "not-json");
+        let original = "[\"keep-me\"]";
+        dir.write_raw("target", original);
+
+        let plan = plan_overwrite_at(dir.path(), "mother", "target");
+        assert!(
+            matches!(&plan, Err(ExpertsBlock::MotherInvalid(message)) if message.contains("不是合法 JSON")),
+            "{plan:?}"
+        );
+
+        let backup = backup_file(&dir);
+        let outcome = overwrite_from_mother_at(dir.path(), "mother", "target", &backup);
+        assert!(matches!(outcome, Err(ExpertsBlock::MotherInvalid(_))));
+        assert_eq!(dir.read("target").unwrap(), original, "母本非法时目标一字不动");
+        assert!(!backup.exists());
+    }
+
+    #[test]
+    fn non_array_mother_is_reported() {
+        let dir = TempDir::new("non-array-mother");
+        dir.write_raw("mother", "{\"experts\":[\"x\"]}");
+        let original = "[\"keep-me\"]";
+        dir.write_raw("target", original);
+
+        let plan = plan_overwrite_at(dir.path(), "mother", "target");
+        assert!(
+            matches!(&plan, Err(ExpertsBlock::MotherInvalid(message)) if message.contains("顶层不是数组")),
+            "{plan:?}"
+        );
+        assert_eq!(dir.read("target").unwrap(), original);
+    }
+
+    #[test]
+    fn invalid_target_json_is_not_overwritten() {
+        let dir = TempDir::new("bad-target");
+        dir.write_list("mother", &["x"]);
+        let original = "not-json";
+        dir.write_raw("target", original);
+
+        let backup = backup_file(&dir);
+        let outcome = overwrite_from_mother_at(dir.path(), "mother", "target", &backup);
+        assert!(
+            matches!(&outcome, Err(ExpertsBlock::TargetInvalid(message)) if message.contains("不是合法 JSON")),
+            "{outcome:?}"
+        );
+        assert_eq!(dir.read("target").unwrap(), original, "不可信的目标清单不得被覆盖");
+        assert!(!backup.exists());
+    }
+
+    #[test]
+    fn same_set_different_order_is_noop() {
+        let dir = TempDir::new("same-set");
+        dir.write_list("mother", &["x", "y"]);
+        // 同一集合，顺序相反、缩进不同：不得覆盖、不得留备份。
+        let original = "[ \"y\",\r\n    \"x\" ]";
+        dir.write_raw("target", original);
+
+        let plan = plan_overwrite_at(dir.path(), "mother", "target").unwrap();
+        assert!(!plan.requires_write);
+        assert_eq!(plan.note, None, "集合一致不是跳过原因，不留提示");
+        assert_eq!(plan.mother_names, vec!["x".to_string(), "y".to_string()]);
+
+        let backup = backup_file(&dir);
+        let outcome = overwrite_from_mother_at(dir.path(), "mother", "target", &backup).unwrap();
+        assert!(!outcome.written);
+        assert_eq!(dir.read("target").unwrap(), original);
+        assert!(!backup.exists());
+    }
+
+    #[test]
+    fn missing_target_dir_is_created_without_backup() {
+        let dir = TempDir::new("fresh-target");
+        dir.write_list("mother", &["x"]);
+
+        let backup = backup_file(&dir);
+        let outcome = overwrite_from_mother_at(dir.path(), "mother", "target", &backup).unwrap();
+
+        assert!(outcome.written);
+        assert!(!outcome.had_content, "目标原本没有清单");
+        assert_eq!(outcome.backup, None, "无原文可留");
+        assert_eq!(
+            parsed(&dir.read("target").unwrap()),
+            json!(["x"]),
+            "目录被创建并写入母本清单"
+        );
+        assert!(!backup.exists());
+    }
+
+    #[test]
+    fn backup_file_content_equals_target_before_overwrite() {
+        let dir = TempDir::new("overwrite-backup");
+        dir.write_list("mother", &["new-expert"]);
+        let original = "[\"old-expert\"]";
+        dir.write_raw("target", original);
+
+        let backup = backup_file(&dir);
+        let outcome = overwrite_from_mother_at(dir.path(), "mother", "target", &backup).unwrap();
+
+        assert!(outcome.written);
+        assert!(outcome.had_content);
+        assert_eq!(outcome.backup.as_deref(), Some(backup.to_string_lossy().as_ref()));
+        assert_eq!(
+            std::fs::read_to_string(&backup).unwrap(),
+            original,
+            "备份就是覆盖前的目标原文"
+        );
+    }
+
+    #[test]
+    fn mother_file_is_never_modified() {
+        let dir = TempDir::new("mother-read-only");
+        let mother_text = "[\n  \"x\",\n  \"y\"\n]";
+        dir.write_raw("mother", mother_text);
+        dir.write_list("target", &["old"]);
+
+        overwrite_from_mother_at(dir.path(), "mother", "target", &backup_file(&dir)).unwrap();
+
+        assert_eq!(dir.read("mother").unwrap(), mother_text, "母本只读");
+        assert!(dir.backups("mother").is_empty(), "母本侧不该出现任何备份");
     }
 
     /// 真实 `~/.workbuddy` 只读校验：并集必须与本机现状一致，且不写任何文件。
