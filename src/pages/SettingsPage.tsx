@@ -678,7 +678,7 @@ function AutoCheckinCard() {
                     <SettingsFieldRow
                       className={PANEL_ROW}
                       label="执行方式"
-                      description="建一条网页会话并驱动它跑完（ACP），完成即计入官方每日活跃。模型优先 hy3（免费），失败回退 deepseek-v4.1-flash。"
+                      description="建一条网页会话并驱动它跑完（ACP），完成即计入官方每日活跃。默认只用免费模型 hy3；付费模型兜底要手改配置文件，界面不提供开关。"
                     >
                       <span className="text-xs text-muted-foreground">跟随签到时间段</span>
                     </SettingsFieldRow>
