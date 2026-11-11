@@ -870,8 +870,6 @@ const MIRROR_STATE_PENDING: &str = "pending";
 const MIRROR_STATE_DONE: &str = "done";
 /// 记忆步骤在报告与清单里的标识：它不是会话，不该冒用 `session_id` 语义。
 const MEMORY_STEP_ID: &str = "MEMORY.md";
-/// 专家团步骤在报告里的标识，同时是 `experts` 模块的清单文件名（同一份约定，勿改）。
-const EXPERTS_STEP_ID: &str = "experts.json";
 
 /// 单条待软删会话的备份登记：恢复只按 `(sessionId, userId, deletedAtWritten)` 三元组精确置空。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1479,20 +1477,12 @@ fn overwrite_target_memory(
     (backup, errors)
 }
 
-/// 专家团步骤的错误项：它不是会话，因此用 `experts.json` 作为标识，不冒用 `session_id` 语义。
+/// 专家团步骤的错误项：它不是会话，因此用清单文件名作标识，不冒用 `session_id` 语义。
 fn expert_step_error(error: impl Into<String>) -> MirrorError {
     MirrorError {
-        session_id: EXPERTS_STEP_ID.to_string(),
+        session_id: experts::EXPERTS_FILE.to_string(),
         error: error.into(),
     }
-}
-
-/// 目标账号的专家团目录：`{memory_root}/experts/custom/<uid>`。
-///
-/// 与 `experts::custom_dir_at` 同一份约定；该函数在 `experts` 模块内私有，镜像侧只在还原
-/// 步骤需要直接落盘备份原文，故此处按同一布局拼接，勿另立第二套路径。
-fn experts_dir_at(memory_root: &Path, uid: &str) -> PathBuf {
-    memory_root.join("experts").join("custom").join(uid)
 }
 
 /// 整份覆盖目标账号的专家团清单：成功回填备份路径，失败折成 `errors`（不阻断软删/复制）。
@@ -1513,6 +1503,9 @@ fn overwrite_target_experts(
 ///
 /// 老清单没有该字段、或备份文件已不在 → 跳过且不报错（会话还原不受影响）；写回前把目标
 /// 当前原文另存 `experts.json.bak-<ms>`，保留用户再反悔的可能。返回 `experts_restored`。
+///
+/// 备份内容必须先校验能解析为名字数组：崩溃窗口可能留下 0 字节/半写备份，直接写回会把
+/// 用户清单清空还报成功。
 fn restore_target_experts(
     memory_root: &Path,
     manifest: &MirrorBackupManifest,
@@ -1530,7 +1523,14 @@ fn restore_target_experts(
             return false;
         }
     };
-    let target = experts_dir_at(memory_root, &manifest.target_uid).join(EXPERTS_STEP_ID);
+    if let Err(error) = experts::parse_experts_text(&content) {
+        warnings.push(format!(
+            "专家团备份内容不可用（{error}），本次跳过专家团还原：{backup}"
+        ));
+        return false;
+    }
+    let target = experts::custom_dir_at(memory_root, &manifest.target_uid)
+        .join(experts::EXPERTS_FILE);
     let Some(parent) = target.parent() else {
         errors.push(expert_step_error("专家团目录路径非法，无法还原"));
         return false;
@@ -1540,7 +1540,7 @@ fn restore_target_experts(
         return false;
     }
     if target.is_file() {
-        let prior = target.with_file_name(format!("{EXPERTS_STEP_ID}.bak-{}", now_ms()));
+        let prior = target.with_file_name(format!("{}.bak-{}", experts::EXPERTS_FILE, now_ms()));
         if let Err(error) = std::fs::copy(&target, &prior) {
             errors.push(expert_step_error(format!(
                 "备份当前专家团清单失败，已跳过还原：{error}"
@@ -3601,13 +3601,13 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn seed_experts(root: &Path, uid: &str, text: &str) {
-        let dir = experts_dir_at(root, uid);
+        let dir = experts::custom_dir_at(root, uid);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join(EXPERTS_STEP_ID), text).unwrap();
+        std::fs::write(dir.join(experts::EXPERTS_FILE), text).unwrap();
     }
 
     fn read_experts(root: &Path, uid: &str) -> Option<String> {
-        std::fs::read_to_string(experts_dir_at(root, uid).join(EXPERTS_STEP_ID)).ok()
+        std::fs::read_to_string(experts::custom_dir_at(root, uid).join(experts::EXPERTS_FILE)).ok()
     }
 
     fn manifest_of(report: &MirrorReport) -> MirrorBackupManifest {
@@ -3760,7 +3760,7 @@ mod tests {
             report
                 .errors
                 .iter()
-                .any(|error| error.session_id == EXPERTS_STEP_ID),
+                .any(|error| error.session_id == experts::EXPERTS_FILE),
             "{:?}",
             report.errors
         );
@@ -3789,7 +3789,7 @@ mod tests {
             "回到镜像前原文"
         );
         // 写回前把当时的目标原文另存，保留再反悔的余地。
-        let dir_target = experts_dir_at(&root, "u-target");
+        let dir_target = experts::custom_dir_at(&root, "u-target");
         let saved: Vec<PathBuf> = std::fs::read_dir(&dir_target)
             .unwrap()
             .flatten()
@@ -3850,6 +3850,30 @@ mod tests {
         assert_eq!(
             read_experts(&root, "u-target").unwrap(),
             "[\n  \"alpha-expert\"\n]"
+        );
+    }
+
+    #[test]
+    fn mirror_restore_skips_experts_when_backup_content_corrupt() {
+        // 崩溃窗口可能留下 0 字节或半写备份：必须校验内容可解析，绝不能让还原把目标清单
+        // 写成空文件还报成功。
+        let dir = TempDir::new("experts-backup-corrupt");
+        let (paths, root, backup) = run_experts_only_mirror(&dir);
+        std::fs::write(backup.join(EXPERTS_BACKUP_FILE), "").unwrap();
+
+        let restored = mirror_restore_at(&paths, &root, WbVariant::Cn, &backup).unwrap();
+
+        assert!(!restored.experts_restored);
+        assert!(restored.errors.is_empty(), "备份不可用不是还原失败：{:?}", restored.errors);
+        assert!(
+            restored.warnings.iter().any(|item| item.contains("专家团")),
+            "{:?}",
+            restored.warnings
+        );
+        assert_eq!(
+            read_experts(&root, "u-target").unwrap(),
+            "[\n  \"alpha-expert\"\n]",
+            "不可用备份不得覆盖目标清单"
         );
     }
 

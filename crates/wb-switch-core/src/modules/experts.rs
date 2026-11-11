@@ -26,12 +26,13 @@ use std::path::{Path, PathBuf};
 use serde_json::{json, Value};
 
 use crate::modules::config::{atomic_write, now_ms, wb_data_root};
+use crate::modules::session_backup;
 
-/// 专家团清单文件名：唯一参与同步的文件。
-const EXPERTS_FILE: &str = "experts.json";
+/// 专家团清单文件名：唯一参与同步的文件（镜像侧复用同一标识，勿另立第二份）。
+pub(crate) const EXPERTS_FILE: &str = "experts.json";
 
 /// 指定 uid 的自定义专家团目录：`{root}/experts/custom/<uid>`。
-fn custom_dir_at(root: &Path, uid: &str) -> PathBuf {
+pub(crate) fn custom_dir_at(root: &Path, uid: &str) -> PathBuf {
     root.join("experts").join("custom").join(uid)
 }
 
@@ -183,7 +184,9 @@ fn read_experts_at(root: &Path, uid: &str) -> Result<Option<Vec<String>>, String
 }
 
 /// 解析一份清单文本：顶层必须是字符串数组，混入非字符串元素即整份不可信。
-fn parse_experts_text(text: &str) -> Result<Vec<String>, String> {
+///
+/// 镜像还原侧复用同一解析口径校验备份内容，避免出现第二份「什么算合法清单」的实现。
+pub(crate) fn parse_experts_text(text: &str) -> Result<Vec<String>, String> {
     let value: Value = serde_json::from_str(text)
         .map_err(|error| format!("{EXPERTS_FILE} 不是合法 JSON，已跳过该账号：{error}"))?;
     let Value::Array(items) = value else {
@@ -298,14 +301,15 @@ pub fn plan_overwrite_at(
 pub struct ExpertsOutcome {
     pub written: bool,
     pub backup: Option<String>,
-    /// 覆盖前目标是否已有清单（`false` = 目录新建 / 无原文可留）。
-    pub had_content: bool,
 }
 
 /// 用母本清单的**原文**整份替换目标清单，覆盖前先把目标原文备份到 `backup_file`。
 ///
-/// 顺序不可颠倒：建目录 → 备份成功 → 才 `atomic_write`。备份失败即放弃覆盖，
+/// 顺序不可颠倒：建目录 → 备份**持久化成功** → 才 `atomic_write`。备份失败即放弃覆盖，
 /// 否则用户原有的清单不可恢复（模块铁律 1）。母本侧任何分支都只读。
+///
+/// 备份走字节级持久写：目标清单可能不是合法 UTF-8（`read_to_string` 会失败），而备份必须
+/// 与原文逐字节一致；`std::fs::copy` 不落盘，崩溃窗口会留下 0 字节备份、还原时清空用户清单。
 pub fn overwrite_from_mother_at(
     root: &Path,
     mother_uid: &str,
@@ -319,7 +323,6 @@ pub fn overwrite_from_mother_at(
         return Ok(ExpertsOutcome {
             written: false,
             backup: None,
-            had_content: target_path.is_file(),
         });
     }
     // 原文照抄：重排会让「原文备份 → 还原」失去字节级对称，也让顺序同母本不一致。
@@ -327,16 +330,14 @@ pub fn overwrite_from_mother_at(
         .map_err(|error| ExpertsBlock::MotherInvalid(format!("读取母本 {EXPERTS_FILE} 失败：{error}")))?;
     std::fs::create_dir_all(&target_dir)
         .map_err(|error| ExpertsBlock::TargetInvalid(format!("创建专家目录失败：{error}")))?;
-    let had_content = target_path.is_file();
-    let backup = if had_content {
-        match std::fs::copy(&target_path, backup_file) {
-            Ok(_) => Some(backup_file.to_string_lossy().to_string()),
-            Err(error) => {
-                return Err(ExpertsBlock::TargetInvalid(format!(
-                    "备份 {EXPERTS_FILE} 失败，已放弃覆盖：{error}"
-                )))
-            }
-        }
+    let backup = if target_path.is_file() {
+        let bytes = std::fs::read(&target_path).map_err(|error| {
+            ExpertsBlock::TargetInvalid(format!("读取 {EXPERTS_FILE} 失败，已放弃覆盖：{error}"))
+        })?;
+        session_backup::durable_write(backup_file, &bytes).map_err(|error| {
+            ExpertsBlock::TargetInvalid(format!("备份 {EXPERTS_FILE} 失败，已放弃覆盖：{error}"))
+        })?;
+        Some(backup_file.to_string_lossy().to_string())
     } else {
         None
     };
@@ -345,7 +346,6 @@ pub fn overwrite_from_mother_at(
     Ok(ExpertsOutcome {
         written: true,
         backup,
-        had_content,
     })
 }
 
@@ -867,7 +867,6 @@ mod tests {
         let outcome = overwrite_from_mother_at(dir.path(), "mother", "target", &backup).unwrap();
 
         assert!(outcome.written);
-        assert!(!outcome.had_content, "目标原本没有清单");
         assert_eq!(outcome.backup, None, "无原文可留");
         assert_eq!(
             parsed(&dir.read("target").unwrap()),
@@ -888,7 +887,6 @@ mod tests {
         let outcome = overwrite_from_mother_at(dir.path(), "mother", "target", &backup).unwrap();
 
         assert!(outcome.written);
-        assert!(outcome.had_content);
         assert_eq!(outcome.backup.as_deref(), Some(backup.to_string_lossy().as_ref()));
         assert_eq!(
             std::fs::read_to_string(&backup).unwrap(),
