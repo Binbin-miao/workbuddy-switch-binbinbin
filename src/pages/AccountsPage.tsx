@@ -694,7 +694,6 @@ export default function AccountsPage() {
     }
   }
 
-  /** 刷新附带的签到遵守账号开关与签到时间段；所有账号照常刷新积分，提示实际忽略/未到时间段数量。 */
   /**
    * 手动跑一次每日活跃（国际版网页通道）。
    *
@@ -727,6 +726,7 @@ export default function AccountsPage() {
     }
   }
 
+  /** 刷新附带的签到遵守账号开关与签到时间段；所有账号照常刷新积分，提示实际忽略/未到时间段数量。 */
   async function onRefreshCredits() {
     if (!visibleAccounts.length || refreshingCredits || checkinAllRunning) return;
     setCheckinAllRunning(true);

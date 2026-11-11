@@ -1318,7 +1318,8 @@ pub async fn checkin(account_id: String) -> Result<Value, String> {
     Ok(checkin::checkin_account(&acc).await)
 }
 
-/// POST /api/checkin/all —— 全部账号批量签到（每个账号按自身档位）。/// `variant` 缺省为 `None`（全部档位，保持原行为）；显式传入时只处理该档位。
+/// POST /api/checkin/all —— 全部账号批量签到（每个账号按自身档位）。
+/// `variant` 缺省为 `None`（全部档位，保持原行为）；显式传入时只处理该档位。
 /// 关闭自动签到的账号逐账号返回 skipped 原因（设置页与托盘同样遵守）。
 /// `respectWindow` 只由账号页「刷新并签到」传 `true`：窗口生效且当前不在时间段内
 /// 时整轮跳过（逐账号 `skipped` / `outside_checkin_window`）；缺省 `false` =
@@ -1348,7 +1349,7 @@ pub async fn daily_activity_all() -> Value {
     web_activity::run_daily_activity_all().await
 }
 
-/// GET /api/activity/config —— 每日活跃开关（默认开启）。
+/// GET /api/activity/config —— 每日活跃开关（默认关闭）。
 #[tauri::command]
 pub fn get_activity_config() -> Value {
     web_activity::load_activity_config()

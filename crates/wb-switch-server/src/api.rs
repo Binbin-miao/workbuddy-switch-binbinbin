@@ -2031,7 +2031,7 @@ async fn api_daily_activity_all() -> Response {
     json_ok(web_activity::run_daily_activity_all().await)
 }
 
-/// GET /api/activity/config —— 每日活跃开关（默认开启）。
+/// GET /api/activity/config —— 每日活跃开关（默认关闭）。
 async fn api_activity_config() -> Response {
     json_ok(web_activity::load_activity_config())
 }
@@ -2055,7 +2055,8 @@ async fn api_save_activity_config(Json(body): Json<Value>) -> Response {
     }
 }
 
-async fn api_checkin_all(body: Option<Json<Value>>) -> Response {    // 缺省（无 body / 无 variant）= 全部档位，保持与桌面端 set 前的行为一致。
+async fn api_checkin_all(body: Option<Json<Value>>) -> Response {
+    // 缺省（无 body / 无 variant）= 全部档位，保持与桌面端 set 前的行为一致。
     let variant = body
         .as_ref()
         .and_then(|Json(value)| value.get("variant"))
