@@ -76,6 +76,19 @@ reasoning effort 方法，所以 `deepseek-v4.1-flash` 的 `onlyReasoning: true`
 
 多账号连续执行时免费模型可能触发上游限流，按候选顺序顺延即可（付费备选需先授权）。
 
+## 付费模型授权
+
+开关默认**不含**付费模型：只试 `hy3`（免费）。需要顺延时，手改
+`~/.wb-switch/daily_activity_config.json`，把 `"allow_paid_model"` 设为 `true`，
+再重启 App（后台调度在启动时读配置）：
+
+```json
+{ "enabled": true, "allow_paid_model": true }
+```
+
+界面上**有意不做**对应开关：付费模型的单次成本按倍率计费，误点一下就产生消耗，
+宁可让用户手动改文件。改完若不生效，检查该文件是否被写坏（损坏一律按 false 处理）。
+
 ## 配置与接口
 
 开关文件：`~/.wb-switch/daily_activity_config.json`，默认

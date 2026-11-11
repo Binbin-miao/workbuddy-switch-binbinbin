@@ -509,12 +509,11 @@ pub fn activity_status() -> Value {
     json!({"today": today, "accounts": accounts})
 }
 
-/// 落盘开关配置；缺失的字段沿用当前值（前端只发改动过的字段）。
+/// 合并一次配置写入：缺失或类型不对的字段沿用 `current`。
 ///
 /// 前端开关只提交 `enabled`，所以 `allow_paid_model` 不传时必须保住原值，否则每次
 /// 切换开关都会把付费授权悄悄抹成 false。
-pub fn save_activity_config(input: &Value) -> std::io::Result<()> {
-    let current = load_activity_config();
+fn merge_activity_config(current: &Value, input: &Value) -> Value {
     let flag = |key: &str| -> bool {
         input
             .get(key)
@@ -522,10 +521,15 @@ pub fn save_activity_config(input: &Value) -> std::io::Result<()> {
             .or_else(|| current.get(key).and_then(Value::as_bool))
             .unwrap_or(false)
     };
-    let cfg = json!({
+    json!({
         "enabled": flag("enabled"),
         "allow_paid_model": flag("allow_paid_model"),
-    });
+    })
+}
+
+/// 落盘开关配置；缺失的字段沿用当前值（前端只发改动过的字段）。
+pub fn save_activity_config(input: &Value) -> std::io::Result<()> {
+    let cfg = merge_activity_config(&load_activity_config(), input);
     let text = serde_json::to_string_pretty(&cfg).map_err(|e| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -561,8 +565,10 @@ fn clock_label(minutes: u32) -> String {
 
 /// 时间窗下界的小时：取签到配置的 `chat_after_hour`，缺省/越界一律 9。
 fn effective_after_hour(cfg: &Value) -> u32 {
+    // `0` 在日常对话里表示「不限制」，但作为国际版兜底下界必须排除，否则
+    // `should_chat_now(hour, 0)` 恒为 true → 窗口未配置时退化成完全不限，凌晨也会跑。
     match cfg.get("chat_after_hour").and_then(Value::as_i64) {
-        Some(hour) if (0..=23).contains(&hour) => hour as u32,
+        Some(hour) if (1..=23).contains(&hour) => hour as u32,
         _ => 9,
     }
 }
@@ -922,6 +928,35 @@ mod tests {
         assert_eq!(effective_after_hour(&json!({"chat_after_hour": 25})), 9);
         assert_eq!(effective_after_hour(&json!({"chat_after_hour": -1})), 9);
         assert_eq!(effective_after_hour(&json!({"chat_after_hour": 7})), 7);
+        // 0 在日常对话里表示「不限制」，作为兜底下界必须排除，否则凌晨也会跑。
+        assert_eq!(effective_after_hour(&json!({"chat_after_hour": 0})), 9);
+    }
+
+    #[test]
+    fn 合并配置_只传enabled不抹掉付费授权() {
+        let current = json!({"enabled": true, "allow_paid_model": true});
+        let merged = merge_activity_config(&current, &json!({"enabled": false}));
+        assert_eq!(merged["enabled"], json!(false));
+        assert_eq!(merged["allow_paid_model"], json!(true));
+    }
+
+    #[test]
+    fn 合并配置_显式传付费授权可覆盖() {
+        let current = json!({"enabled": true, "allow_paid_model": true});
+        let merged = merge_activity_config(&current, &json!({"allow_paid_model": false}));
+        assert_eq!(merged["enabled"], json!(true));
+        assert_eq!(merged["allow_paid_model"], json!(false));
+    }
+
+    #[test]
+    fn 合并配置_坏输入回落当前值() {
+        let current = json!({"enabled": true, "allow_paid_model": true});
+        // 非对象输入 / 字段类型不对：一律沿用当前值，不得把已开的开关关掉或抹掉授权。
+        let 非对象 = merge_activity_config(&current, &json!("not-an-object"));
+        assert_eq!(非对象["enabled"], json!(true));
+        assert_eq!(非对象["allow_paid_model"], json!(true));
+        let 类型不对 = merge_activity_config(&current, &json!({"enabled": "false"}));
+        assert_eq!(类型不对["enabled"], json!(true));
     }
 
     #[test]
