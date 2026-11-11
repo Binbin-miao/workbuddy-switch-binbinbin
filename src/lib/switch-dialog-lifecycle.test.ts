@@ -136,6 +136,9 @@ describe("弹窗打开 / 重开 — initialSwitchExtras 单一初值源", () => 
       ],
       sessionCount: 1,
       copiedCount: 0,
+      expertsPending: false,
+      expertsNames: [],
+      expertsNote: null,
       backupDir: null,
     };
     expect(canSubmitMirror(reopened, stalePreview)).toBe(false);

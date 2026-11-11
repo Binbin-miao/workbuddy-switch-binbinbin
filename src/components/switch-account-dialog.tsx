@@ -1097,11 +1097,11 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
       {/* 镜像切换：显式独立通道。默认全关，绝不并入一键全选 / 工作记忆 / 人设 / 归档。 */}
       <div className="space-y-2 rounded-md border border-destructive/40 px-3 py-2.5">
         <div className="flex items-center justify-between gap-2">
-          <div className="text-sm font-medium">镜像切换（bata）</div>
+          <div className="text-sm font-medium">镜像切换（beta）</div>
           <span className="text-[11px] text-muted-foreground">默认关闭 · 独立通道</span>
         </div>
         <p className="text-xs text-muted-foreground">
-          以当前登录账号为母本，把目标账号的会话集合整份对齐：目标多出的会话软删（可还原），母本多出的会话复制，MEMORY.md 整份覆盖。默认关闭，须先预览逐条清单、再二次确认；执行前逐条复核并先备份，成功后可一键还原。不影响人设、专家团与归档状态。
+          以当前登录账号为母本，把目标账号的会话集合整份对齐：目标多出的会话软删（可还原），母本多出的会话复制，MEMORY.md 与专家团清单整份覆盖。默认关闭，须先预览逐条清单、再二次确认；执行前逐条复核并先备份，成功后可一键还原。人设与归档状态不受影响；专家团清单会跟镜像一起整份覆盖，还原时一并回滚。
         </p>
 
         {/* 启用勾选：镜像与附加同步互斥——勾上后下面三个开关与一键全选一律置灰。 */}
@@ -1196,6 +1196,21 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
                 ))}
               </ul>
             )}
+            {/* 专家团清单：与 MEMORY.md 同形的第三步。跳过不是错误，因此只显示原因、不禁用执行。 */}
+            {mirrorPreview.expertsPending && (
+              <p className="text-xs">
+                {`将把专家团清单整份覆盖为母本「${mirrorMotherLabel}」的 ${mirrorPreview.expertsNames.length} 个：${
+                  mirrorPreview.expertsNames.length > 0
+                    ? mirrorPreview.expertsNames.join("、")
+                    : "（空清单）"
+                }；目标账号独有的专家团会被移除（成功后可在还原时一并回滚）。`}
+              </p>
+            )}
+            {mirrorPreview.expertsNote !== null && (
+              <p className="text-[11px] text-muted-foreground">
+                {`专家团清单本次不覆盖：${mirrorPreview.expertsNote}`}
+              </p>
+            )}
             <label className="flex cursor-pointer items-start gap-2">
               <Checkbox
                 checked={mirror.acknowledged}
@@ -1237,6 +1252,9 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
           <div className="space-y-1 rounded-md border border-amber-500/50 px-2.5 py-2">
             <div className="text-xs font-medium">上次镜像切换的备份（可还原）</div>
             <p className="break-all text-[11px] text-muted-foreground">{mirrorBackup}</p>
+            <p className="text-[11px] text-muted-foreground">
+              会话、MEMORY.md 与专家团清单都会回滚到镜像前
+            </p>
             <Button
               variant="outline"
               size="sm"
@@ -1255,7 +1273,7 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
           <AlertDialogHeader>
             <AlertDialogTitle>确认镜像切换？</AlertDialogTitle>
             <AlertDialogDescription>
-              {`母本「${mirrorMotherLabel}」为准：软删 ${mirrorPreview?.sessionCount ?? 0} 个会话、复制 ${mirrorPreview?.copiedCount ?? 0} 个会话，并把目标账号的 MEMORY.md 整份覆盖为母本的（覆盖前自动备份）。执行前每项仍会重新校验预览凭据与现场摘要，内容已变化会跳过而不是软删；成功后可一键还原。不影响人设、专家团与归档状态。`}
+              {`母本「${mirrorMotherLabel}」为准：软删 ${mirrorPreview?.sessionCount ?? 0} 个会话、复制 ${mirrorPreview?.copiedCount ?? 0} 个会话，并把目标账号的 MEMORY.md 与专家团清单整份覆盖为母本的（覆盖前自动备份）。执行前每项仍会重新校验预览凭据与现场摘要，内容已变化会跳过而不是软删；成功后可一键还原，还原会把 MEMORY.md 与专家团清单一起回滚到镜像前。人设与归档状态不受影响。`}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
@@ -1445,7 +1463,7 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
               {/* 镜像切换独立成 tab，位置固定在「附加同步」右侧（用户明确要求）。 */}
               <TabsTrigger value="mirror" className={TAB_TRIGGER_CLASS}>
                 镜像切换
-                <span className="text-[10px] text-muted-foreground">bata</span>
+                <span className="text-[10px] text-muted-foreground">beta</span>
               </TabsTrigger>
             </TabsList>
             {/* forceMount：切换 tab 不得卸载另一侧，否则关联勾选会被预览重拉重置。 */}

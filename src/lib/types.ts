@@ -343,6 +343,12 @@ export interface MirrorPreview {
   sessionCount: number;
   /** 将从母本复制的会话数（母本有、目标没有，按 LinkGroup 判重）。 */
   copiedCount: number;
+  /** 是否将把目标账号的专家团清单整份覆盖为母本的（母本无清单 / 集合已一致时为 false）。 */
+  expertsPending: boolean;
+  /** 母本账号当前的专家团名字（供逐条复核展示；母本无清单时为空数组）。 */
+  expertsNames: string[];
+  /** 跳过专家团覆盖的原因（如「母本未添加专家团」）；无需跳过时为 null。 */
+  expertsNote: string | null;
   /** 执行前预登记的备份目录（预览阶段为 null）。 */
   backupDir: string | null;
 }
@@ -366,10 +372,16 @@ export interface MirrorReport {
   deletedSessions: number;
   /** 本次从母本复制的会话数。 */
   copiedSessions: number;
+  /** 还原时撤销的「复制新增」会话数（还原路径填充，执行路径恒 0）。 */
+  restoredCopies: number;
   /** 备份绝对路径（明文展示，供一键还原）。 */
   backup: string | null;
   /** 备份成功但落盘失败：备份保留并登记为可还原项。 */
   needsRecovery: boolean;
+  /** 本次是否把专家团清单整份覆盖为母本的。 */
+  expertsUpdated: boolean;
+  /** 还原时是否把专家团清单写回镜像前原文（老备份缺该步骤时为 false，界面据此提示可重试）。 */
+  expertsRestored: boolean;
   /** 已落盘但持久化证明缺失等警告，绝不据此反向写回。 */
   warnings: string[];
   skipped: { sessionId: string; reason: string }[];

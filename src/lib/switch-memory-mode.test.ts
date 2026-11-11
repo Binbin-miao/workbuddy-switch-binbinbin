@@ -351,6 +351,9 @@ function mirrorPreviewFixture(motherUid: string): MirrorPreview {
     targets: [{ sessionId: "s-1", title: "将被软删的会话", userId: "u-target", groupId: "g-1", updatedAt: 1000, fullDigest: "d1", kind: "session" }],
     sessionCount: 1,
     copiedCount: 0,
+    expertsPending: false,
+    expertsNames: [],
+    expertsNote: null,
     backupDir: null,
   };
 }
