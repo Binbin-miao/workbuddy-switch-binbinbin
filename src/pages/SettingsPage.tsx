@@ -621,7 +621,7 @@ function AutoCheckinCard() {
       .getActivityConfig()
       .then(setActivityCfg)
       .catch(() => {
-        /* 读取失败按默认开启显示 */
+        /* 读取失败按默认关闭显示 */
       });
   }, [variant]);
 
@@ -668,7 +668,7 @@ function AutoCheckinCard() {
                     <DemoAction>
                       <Switch
                         aria-label="启用国际版每日活跃"
-                        checked={activityCfg?.enabled ?? true}
+                        checked={activityCfg?.enabled ?? false}
                         onCheckedChange={(next) => void onToggleActivity(next)}
                       />
                     </DemoAction>

@@ -8,38 +8,47 @@
 //! - 桌面端身份发 `chat/completions` **不计入**每日活跃，只有跑完的网页会话算；
 //! - 只建会话不接沙箱，会话会永远停在 `CREATING`、零输出，同样不算；
 //! - 上游对单账号的活跃会话（`status=working`）有硬上限 10 条，建了必须收尾，
-//!   否则攒满后建会话直接 429 / 10105；
+//!   否则攒满后建会话直接 429 / 10105。**本模块自己不清名额**：命中上限就当天放弃，
+//!   因为无法区分「本模块建的 Hi 会话」与「用户此刻正在用的会话」；
 //! - 必须补一条 `session/set_model`，否则跑的是账号默认模型（Auto，按付费计费）。
 //!
 //! 与签到的关系：签到走 `billing` 体系、由服务端 `active` 开关决定；每日活跃走
 //! `/console/as/conversations/` + ACP，没有 `active` 概念，跑完即计分。两者互不影响，
 //! 本模块不触碰任何签到接口。
+//!
+//! 风险声明：这条链路是**社区逆向**出来的非官方接口，路径与报文随时可能变更；
+//! `session/set_model` 已从 ACP 规范（`agentclientprotocol/agent-client-protocol`
+//! 的 `docs/rfds/updates.mdx`）移除，调用失败时只能按会话默认模型跑完这一轮。
 
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use chrono::Timelike;
 use serde_json::{json, Value};
 
 use crate::modules::account::{find_account, variant_of};
-use crate::modules::config::{now_ms, store_dir};
+use crate::modules::config::{now_ms, store_dir, RunFlagGuard};
 use crate::modules::variant::WbVariant;
 
 /// 网页端（控制台）origin。
 const WEB_ORIGIN: &str = "https://www.workbuddy.ai";
 /// 会话集合端点；单条会话的读/动作都在它后面拼 id。
 const CONVERSATIONS_URL: &str = "https://www.workbuddy.ai/console/as/conversations/";
-/// 模型候选序列：主用免费模型，失败顺延到付费备选。
+/// 免费模型：恒在候选列表里。
 ///
 /// 官方国际版模型的积分倍率（`wb_catalog` 的 `credits` 字段，实测 2026-11）：
 /// - `hy3`                 x0.00（免费，192k 上下文）→ 实测一次 40 段输出，成本 0.00
 /// - `deepseek-v4.1-flash` x0.11（300k，effort=high）→ 实测一次 115 段输出，成本 9.36
 ///
 /// 打卡只需要一句「Hi」加一段短回复，没必要用付费模型；`hy3` 不可用（限流 /
-/// 下线）时才顺延到 deepseek。注意网页通道**无法**单独下调思考档位：ACP 只提供
-/// `session/set_model`，没有 reasoning effort 方法，所以 `deepseek-v4.1-flash`
-/// 的 `onlyReasoning: true / defaultEffort: high` 改不动——省钱只能换模型，不能调参。
-const MODEL_CANDIDATES: [&str; 2] = ["hy3", "deepseek-v4.1-flash"];
+/// 下线）时才顺延到付费备选，且必须由用户显式授权（`allow_paid_model`）。
+/// 注意网页通道**无法**单独下调思考档位：ACP 只提供 `session/set_model`，没有
+/// reasoning effort 方法，所以 `deepseek-v4.1-flash` 的 `onlyReasoning: true /
+/// defaultEffort: high` 改不动——省钱只能换模型，不能调参。
+const FREE_MODEL: &str = "hy3";
+/// 付费备用模型：仅在 `allow_paid_model == true` 时进入候选列表。
+const PAID_MODEL: &str = "deepseek-v4.1-flash";
 /// 沙箱域名后缀（E2B on 腾讯云 CloudStudio）。
 const SANDBOX_SUFFIX: &str = ".sandbox.cloudstudio.club";
 /// 单轮最长等待。
@@ -59,6 +68,27 @@ const STATE_FILE: &str = "daily_activity_state.json";
 const ACTIVITY_CONFIG_FILE: &str = "daily_activity_config.json";
 /// 调度轮询间隔：靠状态文件做当天去重，轮询只为「窗口内尽快补上」。
 const CYCLE_INTERVAL: Duration = Duration::from_secs(30 * 60);
+/// 每日活跃的防重入标志：手动触发与后台轮次共用，避免同一账号被并发跑两次。
+static ACTIVITY_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// 本次可以尝试的模型序列：免费模型恒在，付费模型需显式授权。
+fn model_candidates(allow_paid_model: bool) -> Vec<&'static str> {
+    let mut candidates = vec![FREE_MODEL];
+    if allow_paid_model {
+        candidates.push(PAID_MODEL);
+    }
+    candidates
+}
+
+/// 抢每日活跃的运行权；占用中返回 `None`。
+fn try_acquire_activity() -> Option<RunFlagGuard<'static>> {
+    RunFlagGuard::try_acquire(&ACTIVITY_RUNNING)
+}
+
+/// 已有实例在跑时的返回体。
+fn busy_result() -> Value {
+    json!({"ok": false, "busy": true, "error": "每日活跃正在运行，请稍后"})
+}
 
 // ---------------------------------------------------------------------------
 // 客户端构造：沙箱域名走 DoH 兜底
@@ -66,8 +96,8 @@ const CYCLE_INTERVAL: Duration = Duration::from_secs(30 * 60);
 
 /// 用阿里 DoH 查 A 记录。返回第一个 IPv4。
 ///
-/// 为什么要这一步：本机 Clash 以 fake-ip 模式把 `*.sandbox.cloudstudio.club`
-/// 解析成 `198.18.x.x`（保留段），TCP 能连上但 TLS 握手被直接掐断
+/// 为什么要这一步：部分代理以 fake-ip 模式把 `*.sandbox.cloudstudio.club`
+/// 解析成保留段地址，TCP 能连上但 TLS 握手被直接掐断
 /// （`UNEXPECTED_EOF_WHILE_READING`）。真实地址在腾讯云 EdgeOne，直连正常。
 async fn resolve_via_doh(host: &str) -> Option<IpAddr> {
     let client = reqwest::Client::builder()
@@ -92,8 +122,9 @@ async fn resolve_via_doh(host: &str) -> Option<IpAddr> {
 
 /// 为沙箱地址构造专用客户端：把 host 固定解析到 DoH 查到的真实 IP。
 ///
-/// `reqwest::ClientBuilder::resolve` 的覆盖优先于系统解析器，因此 Clash 的
-/// fake-ip 不再生效；证书校验仍按原 host 名进行（SNI 不变）。
+/// `reqwest::ClientBuilder::resolve` 的覆盖优先于系统解析器，因此 fake-ip 不再生效；
+/// 证书校验仍按原 host 名进行（SNI 不变）。DoH 也拿不到地址时不再静默降级——那种
+/// 情况下走系统解析必然又落到 fake-ip，连接注定被掐断，明确报错比无声失败有用。
 async fn sandbox_client(link: &str) -> Result<reqwest::Client, String> {
     let parsed = reqwest::Url::parse(link).map_err(|e| format!("沙箱地址非法: {e}"))?;
     let host = parsed
@@ -104,12 +135,20 @@ async fn sandbox_client(link: &str) -> Result<reqwest::Client, String> {
         .timeout(TURN_TIMEOUT)
         .user_agent(WEB_USER_AGENT);
     if host.ends_with(SANDBOX_SUFFIX) {
-        if let Some(ip) = resolve_via_doh(&host).await {
-            // reqwest 0.12 的 resolve 签名是 (domain: &str, addr: SocketAddr)。
-            builder = builder.resolve(host.as_str(), SocketAddr::new(ip, 443));
-        }
+        let Some(ip) = resolve_via_doh(&host).await else {
+            return Err(
+                "沙箱域名 DNS 解析失败（可能是代理的 fake-ip 模式），请更换网络后重试".to_string(),
+            );
+        };
+        // reqwest 0.12 的 resolve 签名是 (domain: &str, addr: SocketAddr)。
+        builder = builder.resolve(host.as_str(), SocketAddr::new(ip, sandbox_port(&parsed)));
     }
     builder.build().map_err(|e| format!("构造沙箱客户端失败: {e}"))
+}
+
+/// 沙箱连接的端口：地址里写死了就用它，否则按 scheme 的默认端口（https=443）。
+fn sandbox_port(parsed: &reqwest::Url) -> u16 {
+    parsed.port_or_known_default().unwrap_or(443)
 }
 
 /// 控制台 API 的客户端（走系统解析，域名是 www.workbuddy.ai）。
@@ -395,7 +434,8 @@ fn mark_done(uid: &str) {
     }
     let _ = std::fs::create_dir_all(store_dir());
     if let Ok(text) = serde_json::to_string_pretty(&state) {
-        let _ = std::fs::write(state_file(), text);
+        // 原子写：写坏状态文件会让当天重复建会话、重复消耗额度。
+        let _ = crate::modules::config::atomic_write(&state_file(), &text);
     }
 }
 
@@ -407,27 +447,52 @@ fn activity_config_file() -> std::path::PathBuf {
     store_dir().join(ACTIVITY_CONFIG_FILE)
 }
 
-/// 每日活跃开关，默认开启。
+/// 配置默认值：**默认关闭**。
 ///
-/// 默认开是有意的：这条链路用的是免费模型（`hy3`），失败会自动跳过并留到下一
-/// 轮，不会因为「忘了打开」白丢一天的活跃。想关掉就把 `enabled` 写成 false。
-pub fn load_activity_config() -> Value {
-    let mut cfg = json!({"enabled": true});
-    if let Ok(text) = std::fs::read_to_string(activity_config_file()) {
-        if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(&text) {
-            if let Some(enabled) = map.get("enabled").and_then(Value::as_bool) {
-                cfg["enabled"] = json!(enabled);
-            }
-        }
+/// 默认关是有意的：这条链路是社区逆向的非官方接口，且会真的建一条网页会话，所以
+/// 必须由用户显式打开。`allow_paid_model` 同样默认 false：`hy3` 免费，付费备选
+/// （`deepseek-v4.1-flash`，倍率 0.11）需要单独授权。
+fn activity_config_default() -> Value {
+    json!({"enabled": false, "allow_paid_model": false})
+}
+
+/// 解析配置文本；文件缺失、JSON 损坏、字段类型不对一律回落默认值（false）。
+fn parse_activity_config(text: Option<&str>) -> Value {
+    let mut cfg = activity_config_default();
+    let Some(map) = text
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .and_then(|value| value.as_object().cloned())
+    else {
+        return cfg;
+    };
+    if let Some(enabled) = map.get("enabled").and_then(Value::as_bool) {
+        cfg["enabled"] = json!(enabled);
+    }
+    if let Some(allow_paid_model) = map.get("allow_paid_model").and_then(Value::as_bool) {
+        cfg["allow_paid_model"] = json!(allow_paid_model);
     }
     cfg
+}
+
+/// 每日活跃开关配置（默认关闭），返回 `{"enabled": bool, "allow_paid_model": bool}`。
+pub fn load_activity_config() -> Value {
+    let text = std::fs::read_to_string(activity_config_file()).ok();
+    parse_activity_config(text.as_deref())
 }
 
 pub fn activity_enabled() -> bool {
     load_activity_config()
         .get("enabled")
         .and_then(Value::as_bool)
-        .unwrap_or(true)
+        .unwrap_or(false)
+}
+
+/// 是否已授权使用付费备用模型。
+fn activity_allow_paid_model() -> bool {
+    load_activity_config()
+        .get("allow_paid_model")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 /// 各账号今日活跃状态，供账号页渲染 chip。
@@ -444,14 +509,32 @@ pub fn activity_status() -> Value {
     json!({"today": today, "accounts": accounts})
 }
 
+/// 落盘开关配置；缺失的字段沿用当前值（前端只发改动过的字段）。
+///
+/// 前端开关只提交 `enabled`，所以 `allow_paid_model` 不传时必须保住原值，否则每次
+/// 切换开关都会把付费授权悄悄抹成 false。
 pub fn save_activity_config(input: &Value) -> std::io::Result<()> {
-    let enabled = input
-        .get("enabled")
-        .and_then(Value::as_bool)
-        .unwrap_or_else(activity_enabled);
+    let current = load_activity_config();
+    let flag = |key: &str| -> bool {
+        input
+            .get(key)
+            .and_then(Value::as_bool)
+            .or_else(|| current.get(key).and_then(Value::as_bool))
+            .unwrap_or(false)
+    };
+    let cfg = json!({
+        "enabled": flag("enabled"),
+        "allow_paid_model": flag("allow_paid_model"),
+    });
+    let text = serde_json::to_string_pretty(&cfg).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("序列化活跃配置失败: {e}"),
+        )
+    })?;
     let _ = std::fs::create_dir_all(store_dir());
-    let text = serde_json::to_string_pretty(&json!({"enabled": enabled})).unwrap_or_default();
-    std::fs::write(activity_config_file(), text)
+    // 原子写：半截 JSON 会让用户设置丢失（断电/崩溃时）。
+    crate::modules::config::atomic_write(&activity_config_file(), &text)
 }
 
 /// 复用签到的时间段（`checkin_start` / `checkin_end`），本地时区的分钟区间。
@@ -476,56 +559,58 @@ fn clock_label(minutes: u32) -> String {
     format!("{:02}:{:02}", minutes / 60, minutes % 60)
 }
 
+/// 时间窗下界的小时：取签到配置的 `chat_after_hour`，缺省/越界一律 9。
+fn effective_after_hour(cfg: &Value) -> u32 {
+    match cfg.get("chat_after_hour").and_then(Value::as_i64) {
+        Some(hour) if (0..=23).contains(&hour) => hour as u32,
+        _ => 9,
+    }
+}
+
+/// 当前时刻是否允许跑：显式窗口优先，窗口未生效时退化为「到点之后」的下界。
+///
+/// 窗口未配置时**不能**当作「完全不限」——那会让调度一启动就发请求（凌晨也算活跃，
+/// 上游对账日界不确定），所以至少拦到下界小时。
+fn activity_time_gate(window: Option<(u32, u32)>, hour: u32, minute: u32, after_hour: u32) -> bool {
+    match window {
+        Some((start, end)) => {
+            let minutes = hour * 60 + minute;
+            minutes >= start && minutes < end
+        }
+        None => crate::modules::daily_chat::should_chat_now(hour, after_hour),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 编排
 // ---------------------------------------------------------------------------
 
 /// 用指定模型完整跑一次：建会话 → 取沙箱 → ACP → 轮询 → 收尾。
 ///
-/// 返回里 `ok=true` 表示这一轮跑完；`limitBlocked=true` 表示活跃名额满了且腾不
-/// 出来，换模型也无济于事，调用方应直接终止候选循环。
+/// 返回里 `ok=true` 表示这一轮跑完；`limitBlocked=true` 表示活跃名额满了，换模型也
+/// 无济于事，调用方应直接终止候选循环。**命中上限时不清理任何既有会话**：那些会话
+/// 可能是用户此刻正在用的，宁可当天活跃失败也不得中断用户会话。
 async fn attempt_with_model(client: &reqwest::Client, account: &Value, model: &str) -> Value {
     let prompt = "Hi";
     let started = now_ms();
     let mut result = json!({"ok": false, "model": model, "phase": "create"});
 
-    // 1) 建会话（活跃名额满时先停一条最旧的再重试一次）。
+    // 1) 建会话。
     let conversation = match create_conversation(client, account, prompt, model).await {
         Ok(id) => id,
         Err(failure) => {
             if failure.get("limit").and_then(Value::as_bool) == Some(true) {
-                match prune_oldest(client, account).await {
-                    Some(freed) if freed > 0 => {
-                        match create_conversation(client, account, prompt, model).await {
-                            Ok(id) => id,
-                            Err(second) => {
-                                result["limitBlocked"] = json!(true);
-                                result["error"] = json!(format!(
-                                    "活跃会话已达上限（{ACTIVE_LIMIT}），已结束 {freed} 条旧会话后仍失败: {}",
-                                    second
-                                        .get("error")
-                                        .and_then(Value::as_str)
-                                        .unwrap_or("未知")
-                                ));
-                                return result;
-                            }
-                        }
-                    }
-                    _ => {
-                        result["limitBlocked"] = json!(true);
-                        result["error"] = json!(format!(
-                            "活跃会话已达上限（{ACTIVE_LIMIT}），且没有可自动结束的旧会话；请到 {WEB_ORIGIN}/app 结束旧对话后重试"
-                        ));
-                        return result;
-                    }
-                }
+                result["limitBlocked"] = json!(true);
+                result["error"] = json!(format!(
+                    "活跃会话已达上限（{ACTIVE_LIMIT}），请到网页端结束旧对话后重试"
+                ));
             } else {
                 result["error"] = failure
                     .get("error")
                     .cloned()
                     .unwrap_or_else(|| json!("建会话失败"));
-                return result;
             }
+            return result;
         }
     };
     result["conversation"] = json!(conversation);
@@ -624,13 +709,17 @@ async fn attempt_with_model(client: &reqwest::Client, account: &Value, model: &s
 
 /// 对单个账号跑一次每日活跃会话。
 ///
-/// 按 [`MODEL_CANDIDATES`] 从便宜到贵依次尝试，成功即停；只有「活跃名额满且腾
-/// 不出来」会提前终止（换模型也建不出会话）。
+/// 按 [`model_candidates`] 从便宜到贵依次尝试，成功即停；只有「活跃名额满」会提前
+/// 终止（换模型也建不出会话）。
 ///
 /// 返回 `{"ok": bool, "status": ..., "conversation": ..., "model": ...,
 /// "modelsTried": [...], "elapsedMs": ..., "error": ...}`。
-/// `skipped` 表示今天已经做过。
+/// `skipped` 表示今天已经做过；`busy` 表示已有一个实例在跑。
 pub async fn run_daily_activity(account_id: &str) -> Value {
+    // 防重入：手动触发与后台轮次不能并发进同一账号（会双倍消耗额度）。
+    let Some(_guard) = try_acquire_activity() else {
+        return busy_result();
+    };
     let Some(account) = find_account(account_id) else {
         return json!({"ok": false, "error": "账号不存在"});
     };
@@ -656,7 +745,7 @@ pub async fn run_daily_activity(account_id: &str) -> Value {
 
     let mut tried: Vec<&str> = Vec::new();
     let mut last = json!({"ok": false, "error": "没有可用的模型候选"});
-    for model in MODEL_CANDIDATES {
+    for model in model_candidates(activity_allow_paid_model()) {
         tried.push(model);
         let outcome = attempt_with_model(&client, &account, model).await;
         if outcome.get("ok").and_then(Value::as_bool) == Some(true) {
@@ -678,54 +767,36 @@ pub async fn run_daily_activity(account_id: &str) -> Value {
     last
 }
 
-/// 停掉最旧的本模块会话，腾出一个活跃名额。返回腾出的条数。
-async fn prune_oldest(client: &reqwest::Client, account: &Value) -> Option<usize> {
-    let url = format!("{CONVERSATIONS_URL}?page=1&pageSize=50");
-    let req = with_headers(client.get(&url), &web_headers(account));
-    let resp = req.send().await.ok()?;
-    let payload: Value = resp.json().await.ok()?;
-    let list = payload
-        .get("data")
-        .and_then(|d| d.get("conversations"))
-        .and_then(Value::as_array)?
-        .clone();
-    let mut freed = 0usize;
-    for item in list.iter().rev() {
-        let id = item.get("id").and_then(Value::as_str).unwrap_or_default();
-        let status = item.get("status").and_then(Value::as_str).unwrap_or_default();
-        if id.is_empty() || !matches!(status, "working" | "creating" | "running") {
-            continue;
-        }
-        if conversation_action(client, account, id, "stop").await {
-            freed += 1;
-            break;
-        }
-    }
-    Some(freed)
-}
-
 /// 后台调度入口：每天对每个国际版账号跑一次，时间段跟随签到配置。
 ///
 /// 去重靠 `daily_activity_state.json`（uid → 成功日期），所以这个函数可以被高频
 /// 调用：当天已完成的账号在 `run_daily_activity` 里直接 `skipped`，不会发任何
 /// 请求。轮询只是为了让「窗口内失败后还能补一次」。
 ///
-/// 时间段的语义与签到一致：两端都合法且 `start < end` 才生效；未设置 = 不限制。
+/// 时间段的语义与签到一致：两端都合法且 `start < end` 才生效；未设置时退化为
+/// 「`chat_after_hour` 之后」（默认 9 点），不会被当成完全不限。
 pub async fn run_daily_activity_cycle() -> Value {
     if !activity_enabled() {
         return json!({"status": "skipped", "reason": "disabled"});
     }
     let checkin_cfg = crate::modules::config::load_checkin_config();
     let now = chrono::Local::now();
-    let minutes = now.hour() * 60 + now.minute();
-    if let Some((start, end)) = activity_window(&checkin_cfg) {
-        if minutes < start || minutes >= end {
-            return json!({
+    let window = activity_window(&checkin_cfg);
+    let allowed =
+        activity_time_gate(window, now.hour(), now.minute(), effective_after_hour(&checkin_cfg));
+    if !allowed {
+        return match window {
+            Some((start, end)) => json!({
                 "status": "skipped",
                 "reason": "outside_activity_window",
                 "window": format!("{}-{}", clock_label(start), clock_label(end)),
-            });
-        }
+            }),
+            None => json!({
+                "status": "skipped",
+                "reason": "before_activity_hour",
+                "afterHour": effective_after_hour(&checkin_cfg),
+            }),
+        };
     }
     let result = run_daily_activity_all().await;
     // 后台轮询每 30 分钟一次，只记「这一轮真跑了」和「这一轮失败」两种，
@@ -761,13 +832,23 @@ pub fn cycle_interval() -> Duration {
 }
 
 /// 给调用方看的入口：遍历所有国际版账号跑一轮（手动触发，不受开关与时间段限制）。
+///
+/// 账号之间按 `chat_gap_ms` 错开（3~8 秒，同一天同一账号恒定），最后一个不等待：
+/// 连续建会话容易触发上游风控，间隔也让日志可读。
 pub async fn run_daily_activity_all() -> Value {
     let accounts = crate::modules::account::load_accounts();
-    let mut rows = Vec::new();
-    for account in accounts
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let eligible: Vec<&Value> = accounts
         .iter()
         .filter(|acc| variant_of(acc) == WbVariant::Ai)
-    {
+        .collect();
+    let mut rows = Vec::new();
+    for (index, account) in eligible.iter().enumerate() {
+        let uid = account.get("uid").and_then(Value::as_str).unwrap_or_default();
+        if index > 0 {
+            let gap = crate::modules::daily_chat::chat_gap_ms(uid, &today);
+            tokio::time::sleep(Duration::from_millis(gap)).await;
+        }
         let id = account.get("id").and_then(Value::as_str).unwrap_or_default();
         let row = run_daily_activity(id).await;
         rows.push(json!({
@@ -777,4 +858,89 @@ pub async fn run_daily_activity_all() -> Value {
         }));
     }
     json!({"accounts": rows})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 把配置序列化成磁盘形态，用于读写回环。
+    fn 配置文本(enabled: bool, allow_paid_model: bool) -> String {
+        json!({"enabled": enabled, "allow_paid_model": allow_paid_model}).to_string()
+    }
+
+    #[test]
+    fn 配置_默认关闭且解析失败也关闭() {
+        let 缺文件 = parse_activity_config(None);
+        assert_eq!(缺文件["enabled"], json!(false));
+        assert_eq!(缺文件["allow_paid_model"], json!(false));
+
+        let 坏文本 = parse_activity_config(Some("{ 这不是 JSON"));
+        assert_eq!(坏文本["enabled"], json!(false));
+
+        // 字段类型不对（字符串 "true" / 数字 1）同样回落 false，不得猜成 true。
+        let 非布尔 = parse_activity_config(Some(r#"{"enabled":"true","allow_paid_model":1}"#));
+        assert_eq!(非布尔["enabled"], json!(false));
+        assert_eq!(非布尔["allow_paid_model"], json!(false));
+    }
+
+    #[test]
+    fn 模型候选_默认只含免费模型() {
+        assert_eq!(model_candidates(false), vec!["hy3"]);
+    }
+
+    #[test]
+    fn 模型候选_开启付费授权后追加付费模型() {
+        assert_eq!(model_candidates(true), vec!["hy3", "deepseek-v4.1-flash"]);
+    }
+
+    #[test]
+    fn 防重入_标志占用时直接返回busy() {
+        let 第一把 = try_acquire_activity();
+        assert!(第一把.is_some(), "首次获取应当成功");
+        assert!(try_acquire_activity().is_none(), "占用中第二次必须失败");
+        assert_eq!(busy_result()["busy"], json!(true));
+        assert_eq!(busy_result()["ok"], json!(false));
+        drop(第一把);
+        assert!(try_acquire_activity().is_some(), "释放后应能再次获取");
+    }
+
+    #[test]
+    fn 时间窗_未配置窗口时九点前不跑() {
+        // 窗口未生效（None）→ 退化为「到点之后」的下界，默认 9 点。
+        assert!(!activity_time_gate(None, 8, 59, 9), "8:59 早于下界不该跑");
+        assert!(activity_time_gate(None, 9, 0, 9), "9:00 到点应跑");
+        assert!(!activity_time_gate(None, 0, 30, 9), "0:30 也不该跑");
+        // 显式窗口生效时按窗口判定，与下界无关（窗口 9:00-12:00，下界令为 23 点）。
+        assert!(activity_time_gate(Some((540, 720)), 9, 0, 23));
+        assert!(!activity_time_gate(Some((540, 720)), 12, 0, 9));
+    }
+
+    #[test]
+    fn 时间窗_下界配置越界回落到九点() {
+        assert_eq!(effective_after_hour(&json!({})), 9);
+        assert_eq!(effective_after_hour(&json!({"chat_after_hour": 25})), 9);
+        assert_eq!(effective_after_hour(&json!({"chat_after_hour": -1})), 9);
+        assert_eq!(effective_after_hour(&json!({"chat_after_hour": 7})), 7);
+    }
+
+    #[test]
+    fn 配置_原子写后开关与付费授权可读回() {
+        let path = std::env::temp_dir().join(format!("wb-activity-cfg-{}.json", std::process::id()));
+        crate::modules::config::atomic_write(&path, &配置文本(true, true)).expect("原子写失败");
+        let text = std::fs::read_to_string(&path).expect("读回失败");
+        let 读回 = parse_activity_config(Some(&text));
+        assert_eq!(读回["enabled"], json!(true));
+        assert_eq!(读回["allow_paid_model"], json!(true));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn 沙箱_端口缺省回落443() {
+        let 默认地址 =
+            reqwest::Url::parse("https://x.sandbox.cloudstudio.club/acp").expect("URL 非法");
+        assert_eq!(sandbox_port(&默认地址), 443);
+        let 显式端口 = reqwest::Url::parse("https://h:8443/acp").expect("URL 非法");
+        assert_eq!(sandbox_port(&显式端口), 8443);
+    }
 }
