@@ -164,6 +164,8 @@ fn mirror_report_json(result: Result<mirror::MirrorReport, String>) -> Value {
         restored_copies: 0,
         backup: None,
         needs_recovery: false,
+        experts_updated: false,
+        experts_restored: false,
         warnings: Vec::new(),
         skipped: Vec::new(),
         errors: vec![mirror::MirrorError {
@@ -180,7 +182,13 @@ pub fn restore_mirror_backup(backup: &Path) -> Result<mirror::MirrorReport, Stri
     let _guard = crate::modules::auth_transaction::try_auth().map_err(|error| error.to_string())?;
     let paths = SessionPaths::for_variant(variant);
     // 限根：只允许还原落在镜像备份根目录内的路径（硬要求在 mirror 侧围栏，不改回滚算法）。
-    mirror::mirror_restore_within_root(&paths, variant, backup)
+    // 专家团清单挂在数据根下（与档位无关），生产恒取真实数据根。
+    mirror::mirror_restore_within_root(
+        &paths,
+        &crate::modules::config::wb_data_root(),
+        variant,
+        backup,
+    )
 }
 
 /// 从备份目录推断档位：目录约定为 `…/session-transactions/{variant}/{uuid}`。
@@ -906,6 +914,8 @@ mod tests {
             restored_copies: 0,
             backup: Some("/x".to_string()),
             needs_recovery: false,
+            experts_updated: false,
+            experts_restored: false,
             warnings: Vec::new(),
             skipped: Vec::new(),
             errors: Vec::new(),

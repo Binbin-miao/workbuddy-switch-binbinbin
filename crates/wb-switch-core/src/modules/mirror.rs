@@ -18,7 +18,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::modules::auth_file;
-use crate::modules::config::now_ms;
+use crate::modules::config::{atomic_write, now_ms, wb_data_root};
+use crate::modules::experts;
 use crate::modules::memory;
 use crate::modules::session::{
     self, current_user_uid_at, open_db, table_exists, SessionPaths, REASON_PREVIEW_STALE,
@@ -69,6 +70,14 @@ pub struct MirrorPreview {
     pub session_count: usize,
     /// 将从母本复制的会话数（母本有、目标没有，按 LinkGroup 判重）。
     pub copied_count: usize,
+    /// 是否将把目标账号的专家团清单整份覆盖为母本的（母本无清单 / 集合已一致时为 false）。
+    pub experts_pending: bool,
+    /// 母本当前的专家团名字，供界面逐条复核；母本无清单时为空。
+    #[serde(default)]
+    pub experts_names: Vec<String>,
+    /// 跳过专家团覆盖的原因（如「母本未添加专家团」或清单不可信）；无需跳过时为 null。
+    #[serde(default)]
+    pub experts_note: Option<String>,
     /// 执行前预登记的备份目录（预览阶段恒 null）。
     pub backup_dir: Option<String>,
 }
@@ -111,6 +120,12 @@ pub struct MirrorReport {
     pub restored_copies: usize,
     pub backup: Option<String>,
     pub needs_recovery: bool,
+    /// 本次是否把目标账号的专家团清单整份覆盖为母本的（与 `MEMORY.md` 同形的独立步骤）。
+    #[serde(default)]
+    pub experts_updated: bool,
+    /// 还原时是否把专家团清单写回镜像前原文；老备份无该步骤时为 false。
+    #[serde(default)]
+    pub experts_restored: bool,
     pub warnings: Vec<String>,
     pub skipped: Vec<MirrorSkipped>,
     pub errors: Vec<MirrorError>,
@@ -750,14 +765,24 @@ fn build_mirror_token_binding(
 
 /// 生产入口：按档位路径只读预览「当前登录账号 → 目标账号」的整份镜像清单。
 pub fn mirror_preview(variant: WbVariant, target_acc: &Value) -> Result<Value, String> {
-    let preview = mirror_preview_at(&SessionPaths::for_variant(variant), variant, target_acc)?;
+    let preview = mirror_preview_at(
+        &SessionPaths::for_variant(variant),
+        // 专家团清单与人格目录同挂在数据根下（与档位无关），生产恒取真实数据根。
+        &wb_data_root(),
+        variant,
+        target_acc,
+    )?;
     serde_json::to_value(preview).map_err(|error| format!("镜像预览序列化失败：{error}"))
 }
 
 /// 路径注入的可测实现：只读数据库（`read_only = true`），唯一落盘是预览凭据 token
 /// （既有只读预览机制，非会话/记忆数据），绝不写 sessions / MEMORY.md / 正文。
+///
+/// `memory_root` 是人设与专家团清单的根目录（生产为 `wb_data_root()`）：显式传入保证测试
+/// 不触碰真实用户目录，也与执行侧 `mirror_apply_at` 用同一个根，预览与执行结论同源。
 pub fn mirror_preview_at(
     paths: &SessionPaths,
+    memory_root: &Path,
     variant: WbVariant,
     target_acc: &Value,
 ) -> Result<MirrorPreview, String> {
@@ -802,6 +827,13 @@ pub fn mirror_preview_at(
     let preview_token = session_link::save_preview_token(paths, binding)?;
     let auth = auth_file::read_auth_file_at(&paths.auth_file).unwrap_or(Value::Null);
     let mother_label = account_label(&auth, &mother_uid);
+    // 与执行侧同一个纯函数判定（`experts::plan_overwrite_at`），两处结论不会漂移。
+    // 内容不可信不该阻断预览：只在面板上说明跳过原因，才由执行侧折进 errors。
+    let (experts_pending, experts_names, experts_note) =
+        match experts::plan_overwrite_at(memory_root, &mother_uid, &target_uid) {
+            Ok(plan) => (plan.requires_write, plan.mother_names, plan.note),
+            Err(block) => (false, Vec::new(), Some(block.message().to_string())),
+        };
 
     Ok(MirrorPreview {
         mother_uid,
@@ -810,6 +842,9 @@ pub fn mirror_preview_at(
         expected_digest,
         session_count: targets.len(),
         copied_count,
+        experts_pending,
+        experts_names,
+        experts_note,
         targets,
         backup_dir: None,
     })
@@ -820,15 +855,23 @@ pub fn mirror_preview_at(
 // ---------------------------------------------------------------------------
 
 /// 镜像备份清单版本；与操作目录约定一一对应，读到其它版本一律拒绝。
+///
+/// **不要升这个数**：`load_mirror_manifest` 是严格等值校验，升版会让磁盘上所有历史备份在
+/// 还原时被拒，等于既有可还原项全部失效。新增字段一律 `#[serde(default)]` 做同版本扩展
+/// （老 manifest 读成 `None`/空 → 该步骤跳过），代价是同版本内字段语义一旦落盘不可再改。
 const MIRROR_BACKUP_VERSION: u32 = 1;
 /// 镜像备份清单文件名（固定放在操作专属目录内）。
 const MIRROR_MANIFEST_FILE: &str = "mirror-manifest.json";
+/// 专家团清单原文的备份文件名：与清单同级，随操作目录一起持久化。
+const EXPERTS_BACKUP_FILE: &str = "experts-backup.json";
 /// 清单状态：备份已落、软删事务尚未可靠完成（或崩溃窗口），库可能已改但未标记完成。
 const MIRROR_STATE_PENDING: &str = "pending";
 /// 清单状态：软删事务已 commit 且读回校验通过，可放心一键还原。
 const MIRROR_STATE_DONE: &str = "done";
 /// 记忆步骤在报告与清单里的标识：它不是会话，不该冒用 `session_id` 语义。
 const MEMORY_STEP_ID: &str = "MEMORY.md";
+/// 专家团步骤在报告里的标识，同时是 `experts` 模块的清单文件名（同一份约定，勿改）。
+const EXPERTS_STEP_ID: &str = "experts.json";
 
 /// 单条待软删会话的备份登记：恢复只按 `(sessionId, userId, deletedAtWritten)` 三元组精确置空。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -872,6 +915,12 @@ struct MirrorBackupManifest {
     /// 记忆覆盖与 sessions 软删是两个独立可还原步骤，互不替代。
     #[serde(default)]
     memory_backup: Option<String>,
+    /// 本次专家团清单整份覆盖的原文备份绝对路径（若有）；`None` 时还原跳过该步骤。
+    #[serde(default)]
+    experts_backup: Option<String>,
+    /// 本次写入目标账号的专家团名字，供界面明文复核（不参与还原判定）。
+    #[serde(default)]
+    experts_names: Vec<String>,
     restore_steps: Vec<String>,
 }
 
@@ -974,6 +1023,7 @@ fn write_mirror_manifest(
     groups: &[LinkGroup],
     live_targets: &[MirrorTarget],
     deleted_at_written: i64,
+    experts_names: &[String],
 ) -> Result<PathBuf, String> {
     let dir = session_backup::transaction_dir(paths, variant, operation_id)?;
     std::fs::create_dir_all(&dir).map_err(|error| format!("镜像备份目录创建失败：{error}"))?;
@@ -1008,10 +1058,15 @@ fn write_mirror_manifest(
         rows,
         copied: Vec::new(),
         memory_backup: None,
+        // 专家团备份要等覆盖时才产生（且只有目标原本有清单才有原文），故此处先留空，
+        // 由 `finalize_mirror_manifest` 回填。
+        experts_backup: None,
+        experts_names: experts_names.to_vec(),
         restore_steps: vec![
             "按清单逐条把 sessions.deleted_at 置空：WHERE id=? AND user_id=? AND deleted_at=<本清单 deletedAtWritten>".to_string(),
             "只还原本次写入值；严禁按 user_id 批量置空（会误恢复用户此前自删的会话）".to_string(),
             "本备份不涉及会话正文：镜像只软删，不写 jsonl，恢复亦不碰正文".to_string(),
+            "专家团清单的原文备份在 experts-backup.json：还原时整份写回，不做三方合并".to_string(),
         ],
     };
     let content = serde_json::to_string_pretty(&manifest).map_err(|error| error.to_string())?;
@@ -1195,18 +1250,33 @@ pub fn mirror_apply_at(
     // 记忆是否已一致：必须并入「零操作」判定——否则「仅 MEMORY.md 不同」的切号会被整体跳过，
     // 镜像就不算 100%。
     let memory_pending = !memory::memory_already_identical(memory_root, &mother_uid, target_uid);
+    // 专家团清单同理：与预览同一个纯函数判定（I5 单次采样口径），也必须并入零操作判定，
+    // 否则「仅专家团不同」的切号会连备份目录都不建、什么都不做。
+    let experts_plan = experts::plan_overwrite_at(memory_root, &mother_uid, target_uid);
+    let experts_pending = matches!(&experts_plan, Ok(plan) if plan.requires_write);
+    let experts_names: Vec<String> = match &experts_plan {
+        Ok(plan) => plan.mother_names.clone(),
+        Err(_) => Vec::new(),
+    };
+    // 清单不可信是必须上报的错误：即便本次无其它待办，也不能悄悄当成「无操作」吞掉。
+    let experts_plan_error = match &experts_plan {
+        Ok(_) => None,
+        Err(block) => Some(expert_step_error(block.message())),
+    };
 
-    // 既无待删、也无待复制、记忆也已一致：无操作、不建备份目录（避免空还原项）。
-    if live_targets.is_empty() && missing.is_empty() && !memory_pending {
+    // 既无待删、也无待复制、记忆与专家团都已一致：无操作、不建备份目录（避免空还原项）。
+    if live_targets.is_empty() && missing.is_empty() && !memory_pending && !experts_pending {
         return Ok(MirrorReport {
             deleted_sessions: 0,
             copied_sessions: 0,
             restored_copies: 0,
             backup: None,
             needs_recovery: false,
+            experts_updated: false,
+            experts_restored: false,
             warnings: Vec::new(),
             skipped: Vec::new(),
-            errors: Vec::new(),
+            errors: experts_plan_error.into_iter().collect(),
         });
     }
 
@@ -1223,6 +1293,7 @@ pub fn mirror_apply_at(
         &groups,
         &live_targets,
         deleted_at_written,
+        &experts_names,
     )?;
 
     // 软删（可能 0 行）：单事务 commit，随后读回校验。
@@ -1249,14 +1320,26 @@ pub fn mirror_apply_at(
     } else {
         (None, Vec::new())
     };
+    // 专家团清单整份覆盖（只写目标账号）：与记忆步骤同形——失败不阻断已完成的软删/复制，
+    // 备份路径登记进同一清单，作为第三个独立可还原步骤。
+    let (experts_backup, experts_updated, experts_errors) = if experts_pending {
+        overwrite_target_experts(memory_root, &mother_uid, target_uid, &backup_dir)
+    } else {
+        (None, false, Vec::new())
+    };
     let mut errors = copy_errors;
+    errors.extend(experts_plan_error);
     errors.extend(memory_errors);
+    errors.extend(experts_errors);
 
-    // 软删+复制+记忆覆盖完成后把清单原子改写为 done；失败仅降级为 warning。
+    // 软删+复制+记忆覆盖+专家团覆盖完成后把清单原子改写为 done；失败仅降级为 warning。
     let mut warnings = Vec::new();
-    if let Err(error) =
-        finalize_mirror_manifest(&backup_dir, &copied_entries, memory_backup.as_deref())
-    {
+    if let Err(error) = finalize_mirror_manifest(
+        &backup_dir,
+        &copied_entries,
+        memory_backup.as_deref(),
+        experts_backup.as_deref(),
+    ) {
         warnings.push(format!(
             "镜像已完成但清单状态标记失败（{error}）；备份仍在 {}，扫描会显示为 pending",
             backup_dir.display()
@@ -1276,6 +1359,8 @@ pub fn mirror_apply_at(
         restored_copies: 0,
         backup: Some(backup_dir.to_string_lossy().to_string()),
         needs_recovery,
+        experts_updated,
+        experts_restored: false,
         warnings,
         skipped,
         errors,
@@ -1394,11 +1479,90 @@ fn overwrite_target_memory(
     (backup, errors)
 }
 
+/// 专家团步骤的错误项：它不是会话，因此用 `experts.json` 作为标识，不冒用 `session_id` 语义。
+fn expert_step_error(error: impl Into<String>) -> MirrorError {
+    MirrorError {
+        session_id: EXPERTS_STEP_ID.to_string(),
+        error: error.into(),
+    }
+}
+
+/// 目标账号的专家团目录：`{memory_root}/experts/custom/<uid>`。
+///
+/// 与 `experts::custom_dir_at` 同一份约定；该函数在 `experts` 模块内私有，镜像侧只在还原
+/// 步骤需要直接落盘备份原文，故此处按同一布局拼接，勿另立第二套路径。
+fn experts_dir_at(memory_root: &Path, uid: &str) -> PathBuf {
+    memory_root.join("experts").join("custom").join(uid)
+}
+
+/// 整份覆盖目标账号的专家团清单：成功回填备份路径，失败折成 `errors`（不阻断软删/复制）。
+fn overwrite_target_experts(
+    memory_root: &Path,
+    mother_uid: &str,
+    target_uid: &str,
+    backup_dir: &Path,
+) -> (Option<String>, bool, Vec<MirrorError>) {
+    let backup_file = backup_dir.join(EXPERTS_BACKUP_FILE);
+    match experts::overwrite_from_mother_at(memory_root, mother_uid, target_uid, &backup_file) {
+        Ok(outcome) => (outcome.backup, outcome.written, Vec::new()),
+        Err(block) => (None, false, vec![expert_step_error(block.message())]),
+    }
+}
+
+/// 还原专家团清单：把备份原文整份写回（边界⑦：不做三方合并）。
+///
+/// 老清单没有该字段、或备份文件已不在 → 跳过且不报错（会话还原不受影响）；写回前把目标
+/// 当前原文另存 `experts.json.bak-<ms>`，保留用户再反悔的可能。返回 `experts_restored`。
+fn restore_target_experts(
+    memory_root: &Path,
+    manifest: &MirrorBackupManifest,
+    warnings: &mut Vec<String>,
+    errors: &mut Vec<MirrorError>,
+) -> bool {
+    let Some(backup) = manifest.experts_backup.as_deref() else {
+        return false;
+    };
+    let content = match std::fs::read_to_string(backup) {
+        Ok(content) => content,
+        Err(error) => {
+            // 备份目录被清理或备份文件被删：跳过该步骤，不当作还原失败。
+            warnings.push(format!("专家团备份已不可读（{error}），本次跳过专家团还原：{backup}"));
+            return false;
+        }
+    };
+    let target = experts_dir_at(memory_root, &manifest.target_uid).join(EXPERTS_STEP_ID);
+    let Some(parent) = target.parent() else {
+        errors.push(expert_step_error("专家团目录路径非法，无法还原"));
+        return false;
+    };
+    if let Err(error) = std::fs::create_dir_all(parent) {
+        errors.push(expert_step_error(format!("创建专家目录失败：{error}")));
+        return false;
+    }
+    if target.is_file() {
+        let prior = target.with_file_name(format!("{EXPERTS_STEP_ID}.bak-{}", now_ms()));
+        if let Err(error) = std::fs::copy(&target, &prior) {
+            errors.push(expert_step_error(format!(
+                "备份当前专家团清单失败，已跳过还原：{error}"
+            )));
+            return false;
+        }
+    }
+    match atomic_write(&target, &content) {
+        Ok(()) => true,
+        Err(error) => {
+            errors.push(expert_step_error(format!("写回专家团清单失败：{error}")));
+            false
+        }
+    }
+}
+
 /// 软删+复制可靠完成后，把清单原子改写为 done 并登记 copied（durable_write 不产出半写文件）。
 fn finalize_mirror_manifest(
     backup_dir: &Path,
     copied: &[MirrorCopiedEntry],
     memory_backup: Option<&str>,
+    experts_backup: Option<&str>,
 ) -> Result<(), String> {
     let file = backup_dir.join(MIRROR_MANIFEST_FILE);
     let text =
@@ -1407,6 +1571,7 @@ fn finalize_mirror_manifest(
         serde_json::from_str(&text).map_err(|error| format!("镜像清单解析失败：{error}"))?;
     manifest.copied = copied.to_vec();
     manifest.memory_backup = memory_backup.map(str::to_string);
+    manifest.experts_backup = experts_backup.map(str::to_string);
     manifest.state = MIRROR_STATE_DONE.to_string();
     let content = serde_json::to_string_pretty(&manifest).map_err(|error| error.to_string())?;
     session_backup::durable_write_str(&file, &content)
@@ -1430,8 +1595,12 @@ fn load_mirror_manifest(backup_path: &Path) -> Result<MirrorBackupManifest, Stri
 ///
 /// **严禁** `WHERE user_id=?` 批量置空（会误恢复用户此前自己删的会话）；**不碰正文文件**。
 /// 返回的 `deleted_sessions` 表示本次还原行数，`skipped` 为未命中清单。
+///
+/// 专家团清单是文件步骤，无法与 DB 事务共提交：`tx.commit()` 之后单独执行，失败只折进
+/// `errors`（备份目录保留可重试），`experts_restored=false` 由界面明文展示。
 pub fn mirror_restore_at(
     paths: &SessionPaths,
+    memory_root: &Path,
     variant: WbVariant,
     backup_path: &Path,
 ) -> Result<MirrorReport, String> {
@@ -1490,15 +1659,21 @@ pub fn mirror_restore_at(
     }
     tx.commit()
         .map_err(|error| format!("会话数据提交失败：{error}"))?;
+    // 文件侧的第三个可还原步骤：专家团清单回滚到镜像前原文（老备份缺字段则跳过）。
+    let mut warnings = Vec::new();
+    let mut errors = Vec::new();
+    let experts_restored = restore_target_experts(memory_root, &manifest, &mut warnings, &mut errors);
     Ok(MirrorReport {
         deleted_sessions: restored,
         copied_sessions: 0,
         restored_copies,
         backup: Some(backup_path.to_string_lossy().to_string()),
         needs_recovery: false,
-        warnings: Vec::new(),
+        experts_updated: false,
+        experts_restored,
+        warnings,
         skipped,
-        errors: Vec::new(),
+        errors,
     })
 }
 
@@ -1507,6 +1682,7 @@ pub fn mirror_restore_at(
 /// 只在 `mirror_restore_at` 之前加一道路径围栏，**不改其软删/回滚算法**。
 pub fn mirror_restore_within_root(
     paths: &SessionPaths,
+    memory_root: &Path,
     variant: WbVariant,
     backup_path: &Path,
 ) -> Result<MirrorReport, String> {
@@ -1524,7 +1700,7 @@ pub fn mirror_restore_within_root(
         return Err("备份路径不在允许的镜像备份目录内，已拒绝还原".to_string());
     }
     // manifest 内部会再校验 `manifest.variant == variant`，故落到此处的路径与档位一致。
-    mirror_restore_at(paths, variant, &canonical_backup)
+    mirror_restore_at(paths, memory_root, variant, &canonical_backup)
 }
 
 /// 一处镜像备份的可观测摘要（扫描用）：状态、绝对路径、目标账号与软删行数。
@@ -1768,6 +1944,8 @@ pub fn deleted_sync_apply_at(
             restored_copies: 0,
             backup: None,
             needs_recovery: false,
+            experts_updated: false,
+            experts_restored: false,
             warnings: Vec::new(),
             skipped: Vec::new(),
             errors: Vec::new(),
@@ -1792,6 +1970,8 @@ pub fn deleted_sync_apply_at(
         &groups,
         &live_targets,
         deleted_at_written,
+        // 删除同步不碰专家团：清单里不登记任何名字，还原时自然跳过该步骤。
+        &[],
     )?;
 
     let mut by_uid: BTreeMap<String, Vec<MirrorTarget>> = BTreeMap::new();
@@ -1819,7 +1999,7 @@ pub fn deleted_sync_apply_at(
     }
 
     let mut warnings = Vec::new();
-    if let Err(error) = finalize_mirror_manifest(&backup_dir, &[], None) {
+    if let Err(error) = finalize_mirror_manifest(&backup_dir, &[], None, None) {
         warnings.push(format!(
             "删除同步已完成但清单状态标记失败（{error}）；备份仍在 {}，扫描会显示为 pending",
             backup_dir.display()
@@ -1832,6 +2012,8 @@ pub fn deleted_sync_apply_at(
         restored_copies: 0,
         backup: Some(backup_dir.to_string_lossy().to_string()),
         needs_recovery: false,
+        experts_updated: false,
+        experts_restored: false,
         warnings,
         skipped,
         errors: Vec::new(),
@@ -2256,7 +2438,7 @@ mod tests {
             )],
         );
         let preview =
-            mirror_preview_at(&paths, WbVariant::Cn, &json!({ "uid": "u-target" })).unwrap();
+            mirror_preview_at(&paths, &paths.data_root, WbVariant::Cn, &json!({ "uid": "u-target" })).unwrap();
         assert_eq!(preview.session_count, 1, "母本已删 → 目标副本进待删清单");
         assert_eq!(preview.targets[0].session_id, "s-1");
         assert_eq!(preview.copied_count, 0, "母本没有存活会话要复制");
@@ -2290,7 +2472,7 @@ mod tests {
             )],
         );
         let preview =
-            mirror_preview_at(&paths, WbVariant::Cn, &json!({ "uid": "u-target" })).unwrap();
+            mirror_preview_at(&paths, &paths.data_root, WbVariant::Cn, &json!({ "uid": "u-target" })).unwrap();
         assert!(
             preview.targets.is_empty(),
             "缺列时母本行恒按 Alive → 不删：{:?}",
@@ -2488,8 +2670,8 @@ mod tests {
             snapshot(&conn)
         };
 
-        let first = mirror_preview_at(&paths, WbVariant::Cn, &target_acc).unwrap();
-        let second = mirror_preview_at(&paths, WbVariant::Cn, &forged_acc).unwrap();
+        let first = mirror_preview_at(&paths, &paths.data_root, WbVariant::Cn, &target_acc).unwrap();
+        let second = mirror_preview_at(&paths, &paths.data_root, WbVariant::Cn, &forged_acc).unwrap();
 
         assert_eq!(first.mother_uid, "u-mother", "母本恒取登录态");
         assert_eq!(second.mother_uid, "u-mother", "前端伪造 motherUid 无效");
@@ -2524,7 +2706,7 @@ mod tests {
         let dir = TempDir::new("same");
         let paths = paths_for(&dir);
         std::fs::write(&paths.auth_file, r#"{"account":{"uid":"u-same"}}"#).unwrap();
-        let error = mirror_preview_at(&paths, WbVariant::Cn, &json!({ "uid": "u-same" }))
+        let error = mirror_preview_at(&paths, &paths.data_root, WbVariant::Cn, &json!({ "uid": "u-same" }))
             .unwrap_err();
         assert!(error.contains("相同"), "{error}");
     }
@@ -2571,7 +2753,9 @@ mod tests {
 
     /// 走真实只读预览产出计划与凭据，保证执行侧拿到的是「真凭据」而非手搓。
     fn preview_plan(paths: &SessionPaths, target_uid: &str) -> MirrorPlan {
-        let preview = mirror_preview_at(paths, WbVariant::Cn, &json!({ "uid": target_uid })).unwrap();
+        let preview =
+            mirror_preview_at(paths, &paths.data_root, WbVariant::Cn, &json!({ "uid": target_uid }))
+                .unwrap();
         MirrorPlan {
             mother_uid: preview.mother_uid.clone(),
             targets: preview.targets,
@@ -2739,7 +2923,7 @@ mod tests {
         let backup = PathBuf::from(report.backup.clone().unwrap());
         assert!(deleted_at_of(&paths, "s-1").is_some());
 
-        let restored = mirror_restore_at(&paths, WbVariant::Cn, &backup).unwrap();
+        let restored = mirror_restore_at(&paths, &paths.data_root, WbVariant::Cn, &backup).unwrap();
         assert_eq!(restored.deleted_sessions, 1, "只还原本次写入一行");
         assert_eq!(deleted_at_of(&paths, "s-1"), None, "本次软删被还原");
         assert_eq!(
@@ -2779,7 +2963,8 @@ mod tests {
         let report = mirror_apply_at(&paths, WbVariant::Cn, "u-target", &json!({"uid": "u-target"}), &paths.data_root, &plan).unwrap();
         let backup = PathBuf::from(report.backup.clone().unwrap());
 
-        let restored = mirror_restore_within_root(&paths, WbVariant::Cn, &backup).unwrap();
+        let restored =
+            mirror_restore_within_root(&paths, &paths.data_root, WbVariant::Cn, &backup).unwrap();
         assert_eq!(restored.deleted_sessions, 1, "根内路径可还原");
         assert_eq!(deleted_at_of(&paths, "s-1"), None);
     }
@@ -2795,7 +2980,9 @@ mod tests {
 
         let outside = dir.path().join("outside");
         std::fs::create_dir_all(&outside).unwrap();
-        let error = mirror_restore_within_root(&paths, WbVariant::Cn, &outside).unwrap_err();
+        let error =
+            mirror_restore_within_root(&paths, &paths.data_root, WbVariant::Cn, &outside)
+                .unwrap_err();
         assert!(error.contains("不在允许"), "{error}");
     }
 
@@ -3123,7 +3310,7 @@ mod tests {
         let target_acc = json!({"id":"acc-u-target","uid":"u-target","variant":"cn"});
 
         let preview =
-            mirror_preview_at(&paths, WbVariant::Cn, &json!({"uid": "u-target"})).unwrap();
+            mirror_preview_at(&paths, &paths.data_root, WbVariant::Cn, &json!({"uid": "u-target"})).unwrap();
         assert!(preview.targets.is_empty(), "没有母本已删证据 → 一条都不删");
         assert_eq!(preview.copied_count, 3, "3 条无组存活会话全部计入（Bug B）");
 
@@ -3140,7 +3327,7 @@ mod tests {
         assert_eq!(report.copied_sessions, 3, "预览「将复制」与实际复制必须一致");
         assert_eq!(target_active_count(&paths, "u-target"), 3, "目标出现 3 条副本");
 
-        let again = mirror_preview_at(&paths, WbVariant::Cn, &json!({"uid": "u-target"})).unwrap();
+        let again = mirror_preview_at(&paths, &paths.data_root, WbVariant::Cn, &json!({"uid": "u-target"})).unwrap();
         assert_eq!(again.copied_count, 0, "复制后建组 → 不再算缺失，不重复复制");
     }
 
@@ -3318,7 +3505,8 @@ mod tests {
         assert_eq!(target_active_count(&paths, "u-target"), 1, "副本存在");
 
         let backup = PathBuf::from(report.backup.clone().unwrap());
-        let restored = mirror_restore_within_root(&paths, WbVariant::Cn, &backup).unwrap();
+        let restored =
+            mirror_restore_within_root(&paths, &paths.data_root, WbVariant::Cn, &backup).unwrap();
         assert_eq!(restored.restored_copies, 1, "复制新增被撤销");
         assert_eq!(target_active_count(&paths, "u-target"), 0, "副本已软删");
     }
@@ -3406,6 +3594,298 @@ mod tests {
             manifest.memory_backup.is_some(),
             "记忆备份路径必须登记进同一清单"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // 专家团清单整份覆盖：与 MEMORY.md 同形的第三个独立可还原步骤
+    // -----------------------------------------------------------------------
+
+    fn seed_experts(root: &Path, uid: &str, text: &str) {
+        let dir = experts_dir_at(root, uid);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(EXPERTS_STEP_ID), text).unwrap();
+    }
+
+    fn read_experts(root: &Path, uid: &str) -> Option<String> {
+        std::fs::read_to_string(experts_dir_at(root, uid).join(EXPERTS_STEP_ID)).ok()
+    }
+
+    fn manifest_of(report: &MirrorReport) -> MirrorBackupManifest {
+        let dir = PathBuf::from(report.backup.clone().expect("报告应带备份目录"));
+        serde_json::from_str(&std::fs::read_to_string(dir.join(MIRROR_MANIFEST_FILE)).unwrap())
+            .unwrap()
+    }
+
+    /// 「会话齐、MEMORY.md 同、仅专家团不同」的现场跑完一次镜像，返回还原所需的现场。
+    fn run_experts_only_mirror(dir: &TempDir) -> (SessionPaths, PathBuf, PathBuf) {
+        let paths = paths_for(dir);
+        seed_auth(&paths, "u-mother");
+        seed_session_db(&paths, &[]);
+        let root = paths.data_root.clone();
+        seed_experts(&root, "u-mother", "[\n  \"alpha-expert\"\n]");
+        seed_experts(&root, "u-target", "[\"preimage-expert\"]");
+
+        let plan = preview_plan(&paths, "u-target");
+        let report = mirror_apply_at(
+            &paths,
+            WbVariant::Cn,
+            "u-target",
+            &json!({"uid": "u-target"}),
+            &root,
+            &plan,
+        )
+        .unwrap();
+        assert!(
+            report.experts_updated,
+            "前置：专家团必须已被覆盖：{:?}",
+            report.errors
+        );
+        let backup = PathBuf::from(report.backup.clone().expect("前置：必须建备份目录"));
+        (paths, root, backup)
+    }
+
+    #[test]
+    fn mirror_apply_writes_experts_even_when_sessions_already_match() {
+        // 零操作判定回归：会话集合与 MEMORY.md 都已一致，只有专家团不同 → 必须真的写专家团，
+        // 且不得判成「无操作」（漏了这条，「仅专家团不同」的切号会什么都不做）。
+        let dir = TempDir::new("experts-only");
+        let paths = paths_for(&dir);
+        seed_auth(&paths, "u-mother");
+        seed_session_db(&paths, &[]);
+        let root = paths.data_root.clone();
+        seed_experts(&root, "u-mother", "[\n  \"alpha-expert\"\n]");
+        seed_experts(&root, "u-target", "[\"stale-expert\"]");
+
+        let preview =
+            mirror_preview_at(&paths, &root, WbVariant::Cn, &json!({"uid": "u-target"})).unwrap();
+        assert!(preview.experts_pending, "预览必须标出专家团待覆盖");
+        assert_eq!(preview.experts_names, vec!["alpha-expert".to_string()]);
+        assert_eq!(preview.experts_note, None);
+
+        let plan = preview_plan(&paths, "u-target");
+        let report = mirror_apply_at(
+            &paths,
+            WbVariant::Cn,
+            "u-target",
+            &json!({"uid": "u-target"}),
+            &root,
+            &plan,
+        )
+        .unwrap();
+
+        assert!(report.backup.is_some(), "仅专家团不同不得判为零操作");
+        assert!(report.experts_updated);
+        assert_eq!(
+            read_experts(&root, "u-target").unwrap(),
+            "[\n  \"alpha-expert\"\n]",
+            "目标是母本原文（含顺序）"
+        );
+        assert_eq!(
+            read_experts(&root, "u-mother").unwrap(),
+            "[\n  \"alpha-expert\"\n]",
+            "母本只读"
+        );
+        let manifest = manifest_of(&report);
+        assert_eq!(manifest.experts_names, vec!["alpha-expert".to_string()]);
+        let experts_backup = PathBuf::from(manifest.experts_backup.expect("必须登记专家团备份"));
+        assert_eq!(
+            std::fs::read_to_string(&experts_backup).unwrap(),
+            "[\"stale-expert\"]",
+            "备份就是覆盖前的目标原文"
+        );
+    }
+
+    #[test]
+    fn mirror_apply_is_noop_when_sessions_memory_experts_all_match() {
+        let dir = TempDir::new("experts-match");
+        let paths = paths_for(&dir);
+        seed_auth(&paths, "u-mother");
+        seed_session_db(&paths, &[]);
+        let root = paths.data_root.clone();
+        // 集合相同、顺序与缩进不同 → 仍算一致：不写、不留备份、不发生成备份目录。
+        seed_experts(&root, "u-mother", "[\"x\",\"y\"]");
+        let original = "[ \"y\",\r\n  \"x\" ]";
+        seed_experts(&root, "u-target", original);
+
+        let plan = preview_plan(&paths, "u-target");
+        let report = mirror_apply_at(
+            &paths,
+            WbVariant::Cn,
+            "u-target",
+            &json!({"uid": "u-target"}),
+            &root,
+            &plan,
+        )
+        .unwrap();
+
+        assert_eq!(report.backup, None, "三样全同才算零操作");
+        assert!(!report.experts_updated);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(read_experts(&root, "u-target").unwrap(), original, "无变化不得改写");
+    }
+
+    #[test]
+    fn mirror_apply_folds_experts_error_without_blocking_soft_delete() {
+        // 目标清单不可信：不覆盖、报错，但已完成的复制照常保留（失败不阻断）。
+        let dir = TempDir::new("experts-invalid-target");
+        let paths = copy_ready_ungrouped_env(&dir);
+        let root = paths.data_root.clone();
+        seed_experts(&root, "u-mother", "[\"alpha-expert\"]");
+        seed_experts(&root, "u-target", "not-json");
+
+        let preview =
+            mirror_preview_at(&paths, &root, WbVariant::Cn, &json!({"uid": "u-target"})).unwrap();
+        assert!(!preview.experts_pending, "不可信清单不得被覆盖");
+        assert!(
+            preview.experts_note
+                .as_deref()
+                .is_some_and(|note| note.contains("不是合法 JSON")),
+            "{:?}",
+            preview.experts_note
+        );
+
+        let plan = preview_plan(&paths, "u-target");
+        let report = mirror_apply_at(
+            &paths,
+            WbVariant::Cn,
+            "u-target",
+            &json!({"uid": "u-target"}),
+            &root,
+            &plan,
+        )
+        .unwrap();
+
+        assert_eq!(report.copied_sessions, 3, "专家团失败不得阻断复制");
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.session_id == EXPERTS_STEP_ID),
+            "{:?}",
+            report.errors
+        );
+        assert!(!report.experts_updated);
+        assert_eq!(
+            read_experts(&root, "u-target").unwrap(),
+            "not-json",
+            "不可信清单一字不动"
+        );
+    }
+
+    #[test]
+    fn mirror_restore_writes_experts_back_to_preimage() {
+        let dir = TempDir::new("experts-restore");
+        let (paths, root, backup) = run_experts_only_mirror(&dir);
+        // 镜像后用户又加了专家团：还原仍按备份原文整份写回（不做三方合并）。
+        seed_experts(&root, "u-target", "[\"user-added-later\"]");
+
+        let restored = mirror_restore_at(&paths, &root, WbVariant::Cn, &backup).unwrap();
+
+        assert!(restored.experts_restored);
+        assert!(restored.errors.is_empty(), "{:?}", restored.errors);
+        assert_eq!(
+            read_experts(&root, "u-target").unwrap(),
+            "[\"preimage-expert\"]",
+            "回到镜像前原文"
+        );
+        // 写回前把当时的目标原文另存，保留再反悔的余地。
+        let dir_target = experts_dir_at(&root, "u-target");
+        let saved: Vec<PathBuf> = std::fs::read_dir(&dir_target)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().starts_with("experts.json.bak-"))
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert_eq!(saved.len(), 1, "{saved:?}");
+        assert_eq!(
+            std::fs::read_to_string(&saved[0]).unwrap(),
+            "[\"user-added-later\"]"
+        );
+    }
+
+    #[test]
+    fn mirror_restore_skips_experts_for_legacy_manifest() {
+        // 老备份清单（无 expertsBackup / expertsNames 字段）：仍可反序列化、会话照常还原，
+        // 专家团步骤跳过且不报错。
+        let dir = TempDir::new("experts-legacy");
+        let (paths, root, backup) = run_experts_only_mirror(&dir);
+        let file = backup.join(MIRROR_MANIFEST_FILE);
+        let mut value: Value =
+            serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("expertsBackup");
+        object.remove("expertsNames");
+        std::fs::write(&file, serde_json::to_string_pretty(&value).unwrap()).unwrap();
+
+        let restored = mirror_restore_at(&paths, &root, WbVariant::Cn, &backup).unwrap();
+
+        assert!(!restored.experts_restored);
+        assert!(restored.errors.is_empty(), "{:?}", restored.errors);
+        assert_eq!(
+            read_experts(&root, "u-target").unwrap(),
+            "[\n  \"alpha-expert\"\n]",
+            "老备份没有原文可回滚，保持镜像后内容"
+        );
+    }
+
+    #[test]
+    fn mirror_restore_skips_experts_when_backup_file_missing() {
+        let dir = TempDir::new("experts-backup-gone");
+        let (paths, root, backup) = run_experts_only_mirror(&dir);
+        std::fs::remove_file(backup.join(EXPERTS_BACKUP_FILE)).unwrap();
+
+        let restored = mirror_restore_at(&paths, &root, WbVariant::Cn, &backup).unwrap();
+
+        assert!(!restored.experts_restored);
+        assert!(restored.errors.is_empty(), "备份文件被删不是还原失败：{:?}", restored.errors);
+        assert!(
+            restored.warnings.iter().any(|item| item.contains("专家团")),
+            "{:?}",
+            restored.warnings
+        );
+        assert_eq!(
+            read_experts(&root, "u-target").unwrap(),
+            "[\n  \"alpha-expert\"\n]"
+        );
+    }
+
+    #[test]
+    fn mirror_manifest_keeps_version_1_and_reads_back() {
+        // 同版本 schema 扩展：老 JSON 缺新字段也能读成 None / 空，版本号恒定不变。
+        let legacy = json!({
+            "version": 1,
+            "operationId": "op-legacy",
+            "variant": "cn",
+            "motherUid": "u-mother",
+            "targetUid": "u-target",
+            "previewToken": "token",
+            "expectedDigest": "digest",
+            "createdAt": 1,
+            "state": "done",
+            "rows": [],
+            "copied": [],
+            "memoryBackup": null,
+            "restoreSteps": []
+        });
+        let manifest: MirrorBackupManifest = serde_json::from_value(legacy).unwrap();
+        assert_eq!(manifest.version, MIRROR_BACKUP_VERSION, "版本必须保持 1");
+        assert!(manifest.experts_backup.is_none());
+        assert!(manifest.experts_names.is_empty());
+
+        // 新写法落盘后版本仍是 1，且专家团备份字段可回读。
+        let dir = TempDir::new("manifest-expert-fields");
+        let (_, _, backup) = run_experts_only_mirror(&dir);
+        let reread: MirrorBackupManifest = serde_json::from_str(
+            &std::fs::read_to_string(backup.join(MIRROR_MANIFEST_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(reread.version, 1);
+        assert!(reread.experts_backup.is_some());
+        assert_eq!(reread.experts_names, vec!["alpha-expert".to_string()]);
     }
 
     /// 删除同步只动「混合组」：既有人已删、又有人还活着的关联组。
