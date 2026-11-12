@@ -565,6 +565,161 @@ fn session_row_owner(paths: &SessionPaths, cid: &str) -> Option<String> {
     .flatten()
 }
 
+/// 源会话所属分组的快照（`spaces` 行的可移植字段）。
+///
+/// 客户端的「任务分组」存在 `spaces` 表，行按 `user_id` 归属账号，`sessions.space_id`
+/// 指向它；`deleted_at = -1` 是本表的「未删除」约定（与 `sessions` 用 NULL 不同）。
+#[derive(Debug, Clone)]
+struct SpaceSnapshot {
+    name: String,
+    device_id: Option<String>,
+    primary_folder_path: Option<String>,
+    create_folder_path: Option<String>,
+    pinned: i64,
+    sort_order: Option<i64>,
+    transport: Option<String>,
+    source_kind: Option<String>,
+}
+
+/// 读源分组的可移植字段；表不存在 / 行已删 / 列缺失一律 `None`。
+fn read_space_snapshot(conn: &Connection, space_id: &str) -> Option<SpaceSnapshot> {
+    if !table_exists(conn, "spaces") {
+        return None;
+    }
+    conn.query_row(
+        "SELECT name, device_id, primary_folder_path, create_folder_path, \
+                pinned, sort_order, transport, source_kind \
+           FROM spaces WHERE id = ?1 AND deleted_at = -1",
+        [space_id],
+        |row| {
+            Ok(SpaceSnapshot {
+                name: row.get(0)?,
+                device_id: row.get(1)?,
+                primary_folder_path: row.get(2)?,
+                create_folder_path: row.get(3)?,
+                pinned: row.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                sort_order: row.get(5)?,
+                transport: row.get(6)?,
+                source_kind: row.get(7)?,
+            })
+        },
+    )
+    .ok()
+}
+
+/// 目标账号里同名且未删除的分组 id（重名时取最早创建的那条）。
+fn find_space_by_name(conn: &Connection, uid: &str, name: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT id FROM spaces WHERE user_id = ?1 AND name = ?2 AND deleted_at = -1 \
+          ORDER BY created_at LIMIT 1",
+        rusqlite::params![uid, name],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
+}
+
+/// 在目标账号下复制一条源分组；任何失败返回 `Err`，由调用方降级成「不分组」。
+fn insert_space_clone(
+    conn: &Connection,
+    uid: &str,
+    space: &SpaceSnapshot,
+) -> Result<String, String> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = now_ms();
+    conn.execute(
+        "INSERT INTO spaces (id, user_id, device_id, name, primary_folder_path, \
+                             create_folder_path, pinned, sort_order, status, transport, \
+                             conversation_origin, deleted_at, created_at, updated_at, source_kind) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'active', ?9, NULL, -1, ?10, ?10, ?11)",
+        rusqlite::params![
+            id,
+            uid,
+            space.device_id,
+            space.name,
+            space.primary_folder_path,
+            space.create_folder_path,
+            space.pinned,
+            space.sort_order,
+            space.transport,
+            now,
+            space.source_kind,
+        ],
+    )
+    .map_err(|e| format!("目标账号分组创建失败：{e}"))?;
+    Ok(id)
+}
+
+/// 副本该挂到目标账号的哪个分组。
+///
+/// 分组行按 `user_id` 归属账号，所以 `space_id` **不能**原样继承：目标账号没有那一行
+/// 时，客户端按分组渲染会连同会话一起丢弃（与 `project_id` 同因）。这里先复用同名
+/// 分组，没有再复制源分组新建一条；任何一步失败都退回 `None`（副本落到未分组），
+/// 宁可丢分组也不能让会话从列表里消失。
+fn resolve_copy_space_id(
+    target_conn: &Connection,
+    target_uid: &str,
+    source_space: Option<&SpaceSnapshot>,
+) -> Option<String> {
+    let space = source_space?;
+    if let Some(existing) = find_space_by_name(target_conn, target_uid, &space.name) {
+        return Some(existing);
+    }
+    insert_space_clone(target_conn, target_uid, space).ok()
+}
+
+/// 修正账号里「指向别人分组」的悬挂 `space_id`，返回改动条数。
+///
+/// 历史副本曾整列继承母本的 `space_id`，而 `spaces` 行按 `user_id` 归属账号：客户端
+/// 渲染这些会话时找不到分组，会把它们连同会话从列表里一并丢掉（表现就是「镜像说复制
+/// 成功、目标账号里却找不到」）。这里按分组名字在本账号复用/新建同名分组后改挂；
+/// 源分组已不可查时置 `NULL`（落到未分组，至少可见）。
+///
+/// 只动「指向的 space 不存在、不属于本账号或已删除」的行；归属正确的行零改动，
+/// 因此可重复调用（幂等）。返回 `Err` 时可能已修正一部分，重跑会继续收敛。
+pub fn repair_hanging_space_links_at(paths: &SessionPaths, uid: &str) -> Result<usize, String> {
+    let db = paths.workbuddy_db();
+    if !db.is_file() || uid.is_empty() {
+        return Ok(0);
+    }
+    let Some(conn) = open_db(&db, false) else {
+        return Ok(0);
+    };
+    if !table_exists(&conn, "sessions") || !table_exists(&conn, "spaces") {
+        return Ok(0);
+    }
+    if !session_table_columns(&conn)?.iter().any(|col| col == "space_id") {
+        return Ok(0);
+    }
+    let rows: Vec<(String, String)> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT s.id, s.space_id FROM sessions s \
+                  WHERE s.user_id = ?1 AND s.space_id IS NOT NULL AND s.space_id <> '' \
+                    AND NOT EXISTS ( \
+                        SELECT 1 FROM spaces p \
+                         WHERE p.id = s.space_id AND p.user_id = ?1 AND p.deleted_at = -1 \
+                    )",
+            )
+            .map_err(|e| e.to_string())?;
+        let mapped = stmt
+            .query_map([uid], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(|e| e.to_string())?;
+        mapped.flatten().collect()
+    };
+    let mut fixed = 0usize;
+    for (session_id, source_space_id) in rows {
+        let target = read_space_snapshot(&conn, &source_space_id)
+            .and_then(|space| resolve_copy_space_id(&conn, uid, Some(&space)));
+        conn.execute(
+            "UPDATE sessions SET space_id = ?1 WHERE id = ?2 AND user_id = ?3",
+            rusqlite::params![target, session_id, uid],
+        )
+        .map_err(|e| format!("修正会话分组失败：{e}"))?;
+        fixed += 1;
+    }
+    Ok(fixed)
+}
+
 /// 在 workbuddy.db 中把源会话行复制为新 id（动态列，覆盖 id/user_id/时间戳）。
 ///
 /// 跨档时源行与目标行分属两个库：源行从 `source_paths` 读取（跨档用只读连接），
@@ -585,7 +740,9 @@ fn insert_session_copy(
     }
     let src_db = source_paths.workbuddy_db();
     let same_db = src_db == dst_db;
-    let source_row = if src_db.is_file() {
+    // 源分组的快照必须跟着源行一起带出来：跨档时 `spaces` 在源库，目标库看不到它；
+    // 同档虽然同库，但下面会另开目标连接，读一次快照比反复查更省事。
+    let source_row_and_space = if src_db.is_file() {
         // 同档沿用读写连接（与改造前一致）；跨档对源档只读，不触碰源档 WAL 恢复。
         let Some(conn) = open_db(&src_db, !same_db) else {
             return Err("会话数据无法打开".to_string());
@@ -593,9 +750,22 @@ fn insert_session_copy(
         if !table_exists(&conn, "sessions") {
             return Ok(DbCopyOutcome::NoSessionsTable);
         }
-        read_source_session_row(&conn, cid, source_uid)?
+        let row = read_source_session_row(&conn, cid, source_uid)?;
+        let space = row
+            .as_ref()
+            .and_then(|columns| columns.iter().find(|(name, _)| name == "space_id"))
+            .and_then(|(_, value)| match value {
+                rusqlite::types::Value::Text(id) if !id.is_empty() => {
+                    read_space_snapshot(&conn, id)
+                }
+                _ => None,
+            });
+        Some((row, space))
     } else {
         None
+    };
+    let Some((source_row, source_space)) = source_row_and_space else {
+        return Ok(DbCopyOutcome::SourceRowMissing);
     };
     let Some(source_row) = source_row else {
         return Ok(DbCopyOutcome::SourceRowMissing);
@@ -652,6 +822,13 @@ fn insert_session_copy(
             "last_activity_at" => match value {
                 rusqlite::types::Value::Null => rusqlite::types::Value::Integer(now_ms()),
                 other => other,
+            },
+            // 分组归属（客户端「任务分组」= `spaces` 表）不能跨账号继承：`spaces` 行按
+            // `user_id` 归属账号，原样抄 id 会让副本指向目标账号不存在的分组，客户端按
+            // 分组渲染时连会话一起丢弃。这里改挂到目标账号的同名分组（没有就复制一条）。
+            "space_id" => match resolve_copy_space_id(&conn, target_uid, source_space.as_ref()) {
+                Some(id) => rusqlite::types::Value::Text(id),
+                None => rusqlite::types::Value::Null,
             },
             _ => value,
         };
@@ -7051,6 +7228,170 @@ mod tests {
         assert_eq!(title, "旧标题"); // 普通列原样保留
         assert_eq!(deleted_at, None);
         assert_eq!(is_playground, 0);
+    }
+
+    /// 分组归属跨账号必须重建：`spaces` 行按 `user_id` 归属，原样抄 `space_id` 会让副本
+    /// 指向目标账号不存在的分组，客户端按分组渲染时连会话一起丢弃。
+    #[test]
+    fn insert_session_copy_remaps_space_to_target_account() {
+        use std::collections::HashMap;
+
+        let env = ready_env("insert-space");
+        let conn = Connection::open(env.paths.workbuddy_db()).unwrap();
+        conn.execute("ALTER TABLE sessions ADD COLUMN space_id TEXT", [])
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE spaces (
+                 id TEXT PRIMARY KEY, user_id TEXT NOT NULL, device_id TEXT,
+                 name TEXT NOT NULL, primary_folder_path TEXT, create_folder_path TEXT,
+                 pinned INTEGER DEFAULT 0, sort_order INTEGER, status TEXT, transport TEXT,
+                 conversation_origin TEXT, deleted_at INTEGER NOT NULL, created_at INTEGER,
+                 updated_at INTEGER, source_kind TEXT)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO spaces (id, user_id, device_id, name, create_folder_path, pinned,
+                                 sort_order, status, transport, deleted_at, created_at, updated_at, source_kind)
+             VALUES ('src-space', 'uid-a', 'dev-1', '云服务器运维', 'C:/ws/one', 0, NULL,
+                     'active', 'local', -1, 1000, 1000, 'seed')",
+            [],
+        )
+        .unwrap();
+        for (id, space) in [
+            ("src-one", Some("src-space")),
+            ("src-two", Some("src-space")),
+            ("src-orphan", Some("gone-space")),
+        ] {
+            conn.execute(
+                "INSERT INTO sessions (id, user_id, title, cwd, space_id, created_at, updated_at,
+                                       deleted_at, is_playground)
+                 VALUES (?1, 'uid-a', '对话', '/ws', ?2, 1000, 2000, NULL, 0)",
+                rusqlite::params![id, space],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        for (src, dst) in [("src-one", "copy-one"), ("src-two", "copy-two")] {
+            insert_session_copy(&env.paths(), &env.paths(), dst, src, "uid-a", "uid-b").unwrap();
+        }
+        insert_session_copy(
+            &env.paths(),
+            &env.paths(),
+            "copy-orphan",
+            "src-orphan",
+            "uid-a",
+            "uid-b",
+        )
+        .unwrap();
+
+        let conn = Connection::open(env.paths().workbuddy_db()).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT id, space_id FROM sessions WHERE id LIKE 'copy-%' ORDER BY id")
+            .unwrap();
+        let rows: Vec<(String, Option<String>)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .flatten()
+            .collect();
+        let map: HashMap<&str, Option<&str>> = rows
+            .iter()
+            .map(|(id, space)| (id.as_str(), space.as_deref()))
+            .collect();
+        let target_space = map["copy-one"].expect("副本必须挂到目标账号的分组");
+        assert_ne!(target_space, "src-space", "不能沿用源账号的分组 id");
+        assert_eq!(
+            map["copy-two"],
+            Some(target_space),
+            "同一分组的第二个副本必须复用同一个目标分组"
+        );
+        assert_eq!(map["copy-orphan"], None, "源分组已删时副本不得悬挂指向");
+
+        let mut stmt = conn
+            .prepare("SELECT user_id, name, create_folder_path, deleted_at FROM spaces ORDER BY user_id")
+            .unwrap();
+        let spaces: Vec<(String, String, Option<String>, i64)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
+            .unwrap()
+            .flatten()
+            .collect();
+        assert_eq!(spaces.len(), 2, "目标账号只应新建一条同名分组");
+        assert_eq!(spaces[1].0, "uid-b");
+        assert_eq!(spaces[1].1, "云服务器运维");
+        assert_eq!(spaces[1].2.as_deref(), Some("C:/ws/one"), "分组目录随源复制");
+        assert_eq!(spaces[1].3, -1, "新分组必须按 spaces 约定写 -1（未删除）");
+    }
+
+    /// 历史副本的分组悬挂修正：指向别人分组 → 归到本账号同名分组；源分组已删 → 置空。
+    #[test]
+    fn repair_hanging_space_links_moves_copy_into_own_group() {
+        let env = ready_env("repair-space");
+        let conn = Connection::open(env.paths().workbuddy_db()).unwrap();
+        conn.execute("ALTER TABLE sessions ADD COLUMN space_id TEXT", [])
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE spaces (
+                 id TEXT PRIMARY KEY, user_id TEXT NOT NULL, device_id TEXT,
+                 name TEXT NOT NULL, primary_folder_path TEXT, create_folder_path TEXT,
+                 pinned INTEGER DEFAULT 0, sort_order INTEGER, status TEXT, transport TEXT,
+                 conversation_origin TEXT, deleted_at INTEGER NOT NULL, created_at INTEGER,
+                 updated_at INTEGER, source_kind TEXT)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO spaces (id, user_id, device_id, name, create_folder_path, pinned,
+                                 sort_order, status, transport, deleted_at, created_at, updated_at, source_kind)
+             VALUES ('mother-space', 'uid-mother', 'dev-1', '家里云维护', 'C:/ws/home', 0, NULL,
+                     'active', 'local', -1, 1000, 1000, 'seed')",
+            [],
+        )
+        .unwrap();
+        for (id, space) in [
+            ("copy-hanging", Some("mother-space")),
+            ("copy-orphan", Some("deleted-space")),
+            ("copy-fine", None),
+        ] {
+            conn.execute(
+                "INSERT INTO sessions (id, user_id, title, cwd, space_id, created_at, updated_at,
+                                       deleted_at, is_playground)
+                 VALUES (?1, 'uid-target', '对话', '/ws', ?2, 1000, 2000, NULL, 0)",
+                rusqlite::params![id, space],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let fixed = repair_hanging_space_links_at(&env.paths(), "uid-target").unwrap();
+        assert_eq!(fixed, 2, "两条悬挂，一条本来就没分组");
+
+        let conn = Connection::open(env.paths().workbuddy_db()).unwrap();
+        let (own_group, group_name, group_owner): (Option<String>, String, String) = conn
+            .query_row(
+                "SELECT s.space_id, p.name, p.user_id
+                   FROM sessions s JOIN spaces p ON p.id = s.space_id
+                  WHERE s.id = 'copy-hanging'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert!(own_group.is_some());
+        assert_ne!(own_group.as_deref(), Some("mother-space"), "不能继续指向母本分组");
+        assert_eq!(group_name, "家里云维护", "按名字复用/新建同名分组");
+        assert_eq!(group_owner, "uid-target");
+
+        let orphan: Option<String> = conn
+            .query_row("SELECT space_id FROM sessions WHERE id = 'copy-orphan'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(orphan, None, "源分组不可查时置空，副本落到未分组但可见");
+        assert_eq!(
+            repair_hanging_space_links_at(&env.paths(), "uid-target").unwrap(),
+            0,
+            "幂等：修完再跑零改动"
+        );
     }
 
     /// #200 / #199 回归：副本必须落在目标账号本地列表可渲染的形态。

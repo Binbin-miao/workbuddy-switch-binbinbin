@@ -1399,6 +1399,11 @@ pub fn mirror_apply_at(
         )
     })?;
 
+    // 分组归属修补：历史副本可能带着母本的 `space_id`，而 `spaces` 行按 `user_id` 归属
+    // 账号——目标账号没有那一行，客户端按分组渲染时会把会话一起丢掉。复制前先归位，
+    // 新副本才能与老副本落在同一个本地分组里。
+    let space_repair = session::repair_hanging_space_links_at(paths, target_uid);
+
     // 复制母本独有会话：失败不阻断软删，错误进 errors；成功的新副本登记进清单供回滚。
     let (copied_entries, copy_errors, copy_needs_recovery) = if missing.is_empty() {
         (Vec::new(), Vec::new(), false)
@@ -1427,6 +1432,16 @@ pub fn mirror_apply_at(
 
     // 软删+复制+记忆覆盖+专家团覆盖完成后把清单原子改写为 done；失败仅降级为 warning。
     let mut warnings = Vec::new();
+    match space_repair {
+        Ok(0) => {}
+        Ok(fixed) => warnings.push(format!(
+            "已把 {fixed} 条历史会话的分组归到本账号（它们此前指向别的账号的分组，客户端会把它们从列表里丢掉）"
+        )),
+        Err(error) => errors.push(MirrorError {
+            session_id: String::new(),
+            error: format!("修正历史会话分组失败：{error}"),
+        }),
+    }
     if let Err(error) = finalize_mirror_manifest(
         &backup_dir,
         &copied_entries,
