@@ -503,6 +503,16 @@ export interface SessionGroupList {
   storeStatus: "missing" | "ready" | "unavailable";
   storeError?: string;
   groups: SessionGroupSummary[];
+  /**
+   * 客户端数据根目录；`null` 表示未找到（与「有数据根但没建过关联组」区分）。
+   * 可选：旧后端不返回该字段时为 `undefined`，前端按旧文案处理。
+   */
+  dataRoot?: string | null;
+  /**
+   * 数据根三态。`notApplicable` = 客户端天生没有独立数据根（WorkBuddy）；
+   * 缺失（`undefined`）= 旧后端或演示模式，前端回退旧文案，绝不显示「未安装」。
+   */
+  dataRootState?: "ready" | "missing" | "notApplicable";
 }
 
 export interface SessionGroupDetail extends SessionGroupSummary {

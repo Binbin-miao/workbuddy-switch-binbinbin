@@ -20,7 +20,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { displayName } from "@/lib/account-display";
 import * as api from "@/lib/api";
-import type { AccountMeta, Session, SessionGroupClient, SessionGroupCurrentAccount, SessionGroupDetail, SessionGroupMemberDetail, SessionGroupSummary, SessionGroupUnifyPlan, SessionSyncMode, SidecarOutcome, WbVariant } from "@/lib/types";
+import type { AccountMeta, Session, SessionGroupClient, SessionGroupCurrentAccount, SessionGroupDetail, SessionGroupList, SessionGroupMemberDetail, SessionGroupSummary, SessionGroupUnifyPlan, SessionSyncMode, SidecarOutcome, WbVariant } from "@/lib/types";
 import { accountVariant, variantLabel } from "@/lib/variant";
 import { useAccountsStore } from "@/stores/accounts";
 
@@ -33,12 +33,74 @@ const CLIENTS: { id: SessionGroupClient; title: string; description: string }[] 
   { id: "codebuddyIde", title: "CodeBuddy IDE", description: "国内版 / 国际版独立分组" },
 ];
 
+/** 数据根三态：`undefined` = 后端没返回该字段（旧后端 / 演示模式），按「不知道」处理。 */
+type DataRootState = NonNullable<SessionGroupList["dataRootState"]>;
+
+/**
+ * 数据根缺失时的空态标题：按产品逐条给全句。
+ *
+ * 不做 `没有找到{产品}的数据目录` 插值：中文与西文混排的空格规则是按产品定的，
+ * 插值后会得到「CodeBuddy 插件 的数据目录」或「CodeBuddy IDE的数据目录」这类错位文案。
+ */
+const DATA_ROOT_MISSING_TITLE: Record<SessionGroupClient, string> = {
+  workbuddy: "没有找到 WorkBuddy 的数据目录",
+  vscodeExt: "没有找到 CodeBuddy 插件的数据目录",
+  codebuddyIde: "没有找到 CodeBuddy IDE 的数据目录",
+};
+
+/** 数据根缺失的下一步：装没装 / 登录没登录，才是这一态的真实原因。 */
+const DATA_ROOT_MISSING_TAIL = "可能还没安装，或装好后还没登录启动过。装好并登录一次后回到本页刷新即可。";
+
+/** 其余各态沿用改动前的空态文案：WorkBuddy 零回归 + 旧后端回退 + 「没建过关联」都是这一句。 */
+const NO_GROUP_TITLE = "还没有关联会话组";
+const NO_GROUP_TAIL = "从账号切换时复制会话后，关联组会显示在这里。";
+
+/** 数据根就绪、存储可读但当前档位零组：提示可换档，绝不在前端额外数另一档。 */
+const SCOPE_EMPTY_HINT = "这个档位还没有关联会话组，换个档位看看。";
+
+/** 能力不足的禁用原因；表里没有的客户端 = 该入口本就支持新增。 */
+const CAPABILITY_BLOCKED: Partial<Record<SessionGroupClient, string>> = {
+  codebuddyIde: "当前客户端暂不支持新增关联会话",
+};
+
+/** 数据根缺失的禁用原因：把「先做什么」写在按钮上，而不是让用户点进去看见空的来源会话。 */
+const DATA_ROOT_MISSING_BLOCKED: Partial<Record<SessionGroupClient, string>> = {
+  vscodeExt: "没有找到 CodeBuddy 插件的数据目录：请先在 VS Code 里安装插件并登录使用一次",
+};
+
+/** 空态文案：一次查表 + 一次追加判断，没有嵌套分支。 */
+export function emptyNotice({ client, dataRootState, storeStatus, scope }: {
+  client: SessionGroupClient;
+  dataRootState: DataRootState | undefined;
+  storeStatus: SessionGroupList["storeStatus"];
+  /** `undefined` / `null` = 该客户端没有档位概念（只有 CodeBuddy IDE 有）。 */
+  scope?: WbVariant | null;
+}): { title: string; description: string } {
+  const missing = dataRootState === "missing";
+  const title = missing ? DATA_ROOT_MISSING_TITLE[client] : NO_GROUP_TITLE;
+  const tail = missing ? DATA_ROOT_MISSING_TAIL : NO_GROUP_TAIL;
+  const hasScopeHint = dataRootState === "ready" && storeStatus === "ready" && (scope === "cn" || scope === "ai");
+  return { title, description: hasScopeHint ? `${tail}${SCOPE_EMPTY_HINT}` : tail };
+}
+
+/** 「新增关联会话」的禁用原因：能力不足优先于「未安装」，`null` = 可点。 */
+export function blockedReason(client: SessionGroupClient, dataRootState: DataRootState | undefined): string | null {
+  const capability = CAPABILITY_BLOCKED[client];
+  if (capability) return capability;
+  if (dataRootState !== "missing") return null;
+  return DATA_ROOT_MISSING_BLOCKED[client] ?? null;
+}
+
 export default function SessionsPage() {
   const { accounts, fetchAll } = useAccountsStore();
   const [client, setClient] = useState<SessionGroupClient>("workbuddy");
   const [variantScope, setVariantScope] = useState<WbVariant>("cn");
+  /** IDE 档位是否已判定完成：判定前不发列表请求，避免错档位空态闪现 + 双请求。 */
+  const [scopeResolved, setScopeResolved] = useState(false);
   const [groups, setGroups] = useState<SessionGroupSummary[]>([]);
   const [storeStatus, setStoreStatus] = useState<"missing" | "ready" | "unavailable">("missing");
+  /** 数据根三态：`undefined` = 还没读到响应，或旧后端不返回该字段。 */
+  const [dataRootState, setDataRootState] = useState<DataRootState | undefined>(undefined);
   const [storeError, setStoreError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   /** 列表加载进度：分母是筛选后的真实组数；null 表示后端还没回报首帧。 */
@@ -103,6 +165,8 @@ export default function SessionsPage() {
   const listRequestId = useRef(0);
   const detailRequestId = useRef(0);
   const previewRequestId = useRef(0);
+  /** 用户手动切过档位：此后永不自动改写（他的拍板优先）。 */
+  const scopeTouchedRef = useRef(false);
   const contextRef = useRef({ client, scope, selectedGroupId, sourceMemberId });
   contextRef.current = { client, scope, selectedGroupId, sourceMemberId };
   const listContextKey = `${client}:${scope ?? "all"}`;
@@ -129,6 +193,39 @@ export default function SessionsPage() {
     if (accounts.length === 0) void fetchAll();
   }, [accounts.length, fetchAll]);
 
+  /**
+   * IDE 档位默认探测：进入 tab 时落在唯一已登录的那一档，避免「有账号的档位是国际版、
+   * 页面却默认展示国内版空列表」。
+   *
+   * 依赖只有 `client`：一旦依赖 `variantScope`，这里的 `setVariantScope` 会把 effect 自激成环。
+   * `scopeResolved` 在 `finally` 里无条件放行（成功 / reject / 卸载都会走到），
+   * 否则受它把守的列表 effect 会被永久挡住 = 页面永远停在骨架屏。
+   */
+  useEffect(() => {
+    // 非 IDE 客户端没有档位概念；用户手动切过档位时也不再探测（B5：他的选择优先）。
+    if (client !== "codebuddyIde" || scopeTouchedRef.current) {
+      setScopeResolved(true);
+      return;
+    }
+    let live = true;
+    setScopeResolved(false);
+    const variants = ["cn", "ai"] as const;
+    void Promise.allSettled([
+      api.getCodebuddyCnIdeStatus(),
+      api.getCodebuddyIdeStatus(),
+    ]).then((results) => {
+      if (!live || scopeTouchedRef.current) return;
+      const logged = results.flatMap((result, index) =>
+        result.status === "fulfilled" && result.value.activeAccountId ? [variants[index]] : []);
+      // 只有「恰好一档登录」才自动落档：两档都登 / 都没登保持默认 cn，不猜优先级。
+      if (logged.length !== 1) return;
+      setVariantScope(logged[0]);
+    }).finally(() => {
+      if (live) setScopeResolved(true);
+    });
+    return () => { live = false; };
+  }, [client]);
+
   const reloadGroups = useCallback(async () => {
     const key = `${client}:${scope ?? "all"}`;
     const requestId = ++listRequestId.current;
@@ -141,6 +238,7 @@ export default function SessionsPage() {
       if (`${contextRef.current.client}:${contextRef.current.scope ?? "all"}` !== key || listRequestId.current !== requestId) return;
       setGroups(result.groups);
       setStoreStatus(result.storeStatus);
+      setDataRootState(result.dataRootState);
       setStoreError(result.storeError ?? null);
     } catch (error) {
       if (`${contextRef.current.client}:${contextRef.current.scope ?? "all"}` !== key || listRequestId.current !== requestId) return;
@@ -152,6 +250,8 @@ export default function SessionsPage() {
   }, [client, scope]);
 
   useEffect(() => {
+    // 档位判定完成前不发请求：否则会先按 cn 拉一次、判定到 ai 后再拉一次。
+    if (!scopeResolved) return;
     let live = true;
     const requestId = ++listRequestId.current;
     const key = listContextKey;
@@ -167,6 +267,7 @@ export default function SessionsPage() {
       if (!live || listRequestId.current !== requestId || `${contextRef.current.client}:${contextRef.current.scope ?? "all"}` !== key) return;
       setGroups(result.groups);
       setStoreStatus(result.storeStatus);
+      setDataRootState(result.dataRootState);
       setStoreError(result.storeError ?? null);
     }).catch((error) => {
       if (!live || listRequestId.current !== requestId || `${contextRef.current.client}:${contextRef.current.scope ?? "all"}` !== key) return;
@@ -176,7 +277,7 @@ export default function SessionsPage() {
       if (live && listRequestId.current === requestId && `${contextRef.current.client}:${contextRef.current.scope ?? "all"}` === key) setLoading(false);
     });
     return () => { live = false; };
-  }, [client, scope, listContextKey]);
+  }, [client, scope, listContextKey, scopeResolved]);
 
   // 列表加载进度双通道：桌面端听 `session-groups-progress` 事件，webui 轮询
   // `/api/session-groups/progress`。只在加载期间订阅，加载完立刻退订。
@@ -552,6 +653,8 @@ export default function SessionsPage() {
   ];
   const pages = Array.from({ length: pageCount }, (_, index) => index + 1)
     .filter((value) => value === 1 || value === pageCount || Math.abs(value - currentPage) <= 1);
+  /** 空集文案由数据根三态决定；`groups.length === 0` 是本页唯一的空集判据。 */
+  const emptyGroups = emptyNotice({ client, dataRootState, storeStatus, scope });
 
   return (
     <div data-detail-mode={detailMode} className="mx-auto w-full max-w-[1180px] min-w-0 px-6 py-8 sm:px-8 sm:py-9">
@@ -564,7 +667,7 @@ export default function SessionsPage() {
             </div>
             <div className="flex max-w-full flex-wrap items-center justify-end gap-2">
               <Button variant="outline" size="sm" className="shrink-0" onClick={() => void (selectedGroupId ? reloadSelectedGroup() : reloadGroups())} disabled={loading || detailLoading}><RefreshCw className={loading ? "animate-spin" : undefined} />刷新</Button>
-              <AddLinkedSessionDialog client={client} disabled={loading} onDone={() => void (selectedGroupId ? reloadSelectedGroup() : reloadGroups())} requestRestartConfirm={(actionLabel, run) => setRestartPrompt({ actionLabel, run })} />
+              <AddLinkedSessionDialog client={client} dataRootState={dataRootState} disabled={loading} onDone={() => void (selectedGroupId ? reloadSelectedGroup() : reloadGroups())} requestRestartConfirm={(actionLabel, run) => setRestartPrompt({ actionLabel, run })} />
             </div>
           </div>
           <Tabs value={client} onValueChange={changeClient} className="mt-4">
@@ -584,7 +687,7 @@ export default function SessionsPage() {
           </div>
           <div className="my-4 flex flex-wrap items-center justify-between gap-2">
             <div className="flex min-w-0 max-w-full flex-wrap items-center gap-2">
-              {client === "codebuddyIde" && <Select value={variantScope} onValueChange={(value) => { setVariantScope(value as WbVariant); setSelectedGroupId(null); setDetailOpen(false); }}><SelectTrigger size="sm" className="w-32 bg-background text-xs" aria-label="选择 CodeBuddy IDE 档位"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="cn">国内版</SelectItem><SelectItem value="ai">国际版</SelectItem></SelectContent></Select>}
+              {client === "codebuddyIde" && <Select value={variantScope} onValueChange={(value) => { scopeTouchedRef.current = true; setVariantScope(value as WbVariant); setSelectedGroupId(null); setDetailOpen(false); }}><SelectTrigger size="sm" className="w-32 bg-background text-xs" aria-label="选择 CodeBuddy IDE 档位"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="cn">国内版</SelectItem><SelectItem value="ai">国际版</SelectItem></SelectContent></Select>}
               <Tabs value={statusFilter} onValueChange={setStatusFilter} className="min-w-0 max-w-full gap-0">
                 <TabsList className="h-auto max-w-full flex-wrap justify-start gap-0.5" aria-label="按状态筛选">
                   {statusOptions.filter(([value]) => ["all", "behind", "diverge", "latest"].includes(value) || value === statusFilter || groups.some((group) => group.summaryStatus === value)).map(([value, label]) => <TabsTrigger key={value} value={value} className="h-8 gap-1.5 px-2.5 hover:bg-background/60">
@@ -597,7 +700,7 @@ export default function SessionsPage() {
           </div>
           {(storeStatus === "unavailable" || storeError) && <p role="status" className="mb-3 rounded-lg border border-amber-500/30 p-3 text-sm text-muted-foreground">{storeError ?? "关联组存储暂不可用，当前只展示可读取的数据。"}</p>}
           {loadError && <div role="alert" className="mb-3 rounded-lg border border-destructive/30 p-3 text-sm text-destructive">{loadError}<Button variant="outline" size="sm" className="ml-2" onClick={() => void reloadGroups()}>重试</Button></div>}
-          {loading ? <GroupSkeleton progress={loadProgress} /> : filteredGroups.length === 0 ? <div className="flex min-h-56 flex-col items-center justify-center rounded-xl border border-dashed p-6 text-center"><Layers3 className="size-7 text-muted-foreground" /><h3 className="mt-3 text-sm font-medium">{groups.length === 0 ? "还没有关联会话组" : "没有符合条件的会话"}</h3><p className="mt-2 text-sm text-muted-foreground">{groups.length === 0 ? "从账号切换时复制会话后，关联组会显示在这里。" : "试试其它筛选条件。"}</p></div> : <div className={`grid min-w-0 gap-3 ${contentWidth >= 600 ? "grid-cols-2" : "grid-cols-1"}`}>{visibleGroups.map((group) => <SessionGroupCard key={group.key} group={group} selected={group.groupId === selectedGroupId} onSelect={() => openDetail(group.groupId)} onRequestDelete={() => setDeleteTarget(group)} />)}</div>}
+          {loading ? <GroupSkeleton progress={loadProgress} /> : filteredGroups.length === 0 ? <div className="flex min-h-56 flex-col items-center justify-center rounded-xl border border-dashed p-6 text-center"><Layers3 className="size-7 text-muted-foreground" /><h3 className="mt-3 text-sm font-medium">{groups.length === 0 ? emptyGroups.title : "没有符合条件的会话"}</h3><p className="mt-2 text-sm text-muted-foreground">{groups.length === 0 ? emptyGroups.description : "试试其它筛选条件。"}</p></div> : <div className={`grid min-w-0 gap-3 ${contentWidth >= 600 ? "grid-cols-2" : "grid-cols-1"}`}>{visibleGroups.map((group) => <SessionGroupCard key={group.key} group={group} selected={group.groupId === selectedGroupId} onSelect={() => openDetail(group.groupId)} onRequestDelete={() => setDeleteTarget(group)} />)}</div>}
           {!loading && filteredGroups.length > PAGINATION_HIDE_MAX && <div className="mt-6 flex flex-wrap items-center justify-between gap-3 text-xs text-muted-foreground"><span>显示 {(currentPage - 1) * PAGE_SIZE + 1}–{Math.min(currentPage * PAGE_SIZE, filteredGroups.length)}，共 {filteredGroups.length} 个会话</span><nav aria-label="会话分页" className="flex flex-wrap items-center gap-1.5"><Button variant="outline" size="icon" className="size-8" aria-label="上一页" disabled={currentPage <= 1} onClick={() => setPage(currentPage - 1)}><ChevronLeft /></Button>{pages.map((value, index) => <span key={value} className="flex items-center gap-1.5">{index > 0 && value - pages[index - 1] > 1 && <span>…</span>}<Button variant={value === currentPage ? "default" : "outline"} className={`size-8 p-0 ${value === currentPage ? "bg-brand text-brand-foreground hover:bg-brand/90" : ""}`} aria-label={`第 ${value} 页`} aria-current={value === currentPage ? "page" : undefined} onClick={() => setPage(value)}>{value}</Button></span>)}<Button variant="outline" size="icon" className="size-8" aria-label="下一页" disabled={currentPage >= pageCount} onClick={() => setPage(currentPage + 1)}><ChevronRight /></Button></nav></div>}
         </section>
       </div>
@@ -657,8 +760,10 @@ const LINKED_TREE_MIN_H = "min-h-[min(10rem,30vh)]";
  * 本次仅 WorkBuddy 客户端开放；其他客户端入口禁用（其复制 / 关联能力后续再补）。执行沿用
  * `copySessionsCross`：来源会话已属于某关联组则加入该组，未关联则新建关联组。
  */
-function AddLinkedSessionDialog({ client, disabled, onDone, requestRestartConfirm }: {
+function AddLinkedSessionDialog({ client, dataRootState, disabled, onDone, requestRestartConfirm }: {
   client: SessionGroupClient;
+  /** 数据根三态：`undefined` = 后端没返回该字段（旧后端 / 演示模式），按「不知道」处理，不禁用。 */
+  dataRootState?: DataRootState;
   disabled: boolean;
   onDone: () => void;
   /** 插件侧运行中：请求页面统一的「关闭并重开」确认框；用户确认后执行 `run`。 */
@@ -685,8 +790,8 @@ function AddLinkedSessionDialog({ client, disabled, onDone, requestRestartConfir
   const sourceAccount = workbuddyAccounts.find((account) => account.id === sourceAccountId) ?? null;
   const targetAccount = workbuddyAccounts.find((account) => account.id === targetAccountId) ?? null;
   const targetOptions = workbuddyAccounts.filter((account) => account.id !== sourceAccountId);
-  const supported = client === "workbuddy" || client === "vscodeExt";
-  const unsupportedTitle = "当前客户端暂不支持新增关联会话";
+  /** 禁用原因：能力不足 或 数据根缺失（`null` = 可点，标题回到「新增关联会话」）。 */
+  const blocked = blockedReason(client, dataRootState);
   /** 弹窗文案用：来源账号的客户端称呼。 */
   const clientAccountLabel = client === "workbuddy" ? "WorkBuddy 账号" : "CodeBuddy 插件账号";
 
@@ -888,9 +993,9 @@ function AddLinkedSessionDialog({ client, disabled, onDone, requestRestartConfir
         ? `复制并关联到「${displayName(targetAccount)}」`
         : `勾选要复制到「${displayName(targetAccount)}」的会话`;
   return <Dialog open={open} onOpenChange={openChange}>
-    <span className="inline-flex" title={supported ? undefined : unsupportedTitle}>
+    <span className="inline-flex" title={blocked ?? undefined}>
       <DialogTrigger asChild>
-        <Button size="sm" className="shrink-0 bg-brand text-brand-foreground hover:bg-brand/90" disabled={disabled || !supported} title={supported ? "新增关联会话" : unsupportedTitle}><Link2 />新增关联会话</Button>
+        <Button size="sm" className="shrink-0 bg-brand text-brand-foreground hover:bg-brand/90" disabled={disabled || !!blocked} title={blocked ?? "新增关联会话"}><Link2 />新增关联会话</Button>
       </DialogTrigger>
     </span>
     <DialogContent showCloseButton={!busy} onEscapeKeyDown={blockDismissWhileBusy} onPointerDownOutside={blockDismissWhileBusy} onInteractOutside={blockDismissWhileBusy} className="flex max-h-[min(90vh,calc(100vh-2rem))] min-w-0 flex-col overflow-hidden">

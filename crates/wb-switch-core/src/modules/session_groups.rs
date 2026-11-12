@@ -63,6 +63,19 @@ impl SessionClient {
         }
     }
 
+    /// 数据根的三态视图；与 [`Self::data_root`] 成对（解析规则只有 `data_root` 一处）。
+    ///
+    /// 两级判定：根存在 + 该根下有这个客户端的专属段。根由同产品其它客户端创建是常态，
+    /// 只看根会把「没装这个客户端」误判成已就绪。
+    fn data_root_view(self) -> (DataRootState, Option<String>) {
+        let root = self.data_root();
+        let client_data_present = match (root.as_deref(), self.store_spec()) {
+            (Some(path), Some(spec)) => has_client_data(path, spec),
+            _ => false,
+        };
+        classify_data_root(self, root, client_data_present)
+    }
+
     fn store_spec(self) -> Option<SessionStoreSpec> {
         match self {
             Self::Workbuddy => None,
@@ -81,6 +94,58 @@ impl SessionClient {
                 Err("只有 CodeBuddy IDE 支持档位筛选".to_string())
             }
         }
+    }
+}
+
+/// 客户端数据根的三态。
+///
+/// `NotApplicable` 不是「未安装」：WorkBuddy 的会话就在 `~/.workbuddy`，天生没有独立数据根，
+/// 把它的 `None` 一律报成 `Missing` 会对用户说谎。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataRootState {
+    Ready,
+    Missing,
+    NotApplicable,
+}
+
+impl DataRootState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Missing => "missing",
+            Self::NotApplicable => "notApplicable",
+        }
+    }
+}
+
+/// 该根下是否存在任何账号的客户端专属段：`<root>/<uid>/<client_dir>`。
+///
+/// 只判「有没有这个客户端的段」，不校验账号是否在账号库里（换了账号也要能看见）。
+/// 必须看这一级：共享根目录由同产品的其它客户端创建，只看根会把「没装这个客户端」判成已就绪。
+fn has_client_data(root: &Path, spec: SessionStoreSpec) -> bool {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let uid = entry.file_name().to_string_lossy().into_owned();
+        vscode_session::is_safe_uid(&uid) && entry.path().join(spec.client_dir).is_dir()
+    })
+}
+
+/// 数据根三态判定（纯函数，不碰磁盘）：根与「客户端段是否存在」都由调用方解析后注入。
+fn classify_data_root(
+    client: SessionClient,
+    root: Option<PathBuf>,
+    client_data_present: bool,
+) -> (DataRootState, Option<String>) {
+    if matches!(client, SessionClient::Workbuddy) {
+        return (DataRootState::NotApplicable, None);
+    }
+    match root {
+        Some(path) if client_data_present => {
+            (DataRootState::Ready, Some(path.to_string_lossy().into_owned()))
+        }
+        _ => (DataRootState::Missing, None),
     }
 }
 
@@ -124,10 +189,14 @@ pub fn list_with_progress(
 ) -> Result<Value, String> {
     client.validate_scope(scope)?;
     let paths = client.store_paths();
+    // 一次注入、三分支共享：数据根状态与 store 状态无关，不能等某条分支才补。
+    let (data_root_state, data_root) = client.data_root_view();
     let mut result = json!({
         "client": client.as_str(),
         "variantScope": scope.map(WbVariant::as_str),
         "storeStatus": "missing",
+        "dataRootState": data_root_state.as_str(),
+        "dataRoot": data_root,
         "groups": [],
     });
     match session_link::load_store(&paths) {
@@ -2926,5 +2995,84 @@ mod tests {
                 "{key} 为 Null 时应补成数组并保留合并内容"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod data_root_view_tests {
+    use super::*;
+
+    #[test]
+    fn missing_data_root_is_reported_as_missing_without_a_path() {
+        assert_eq!(
+            classify_data_root(SessionClient::CodebuddyIde, None, false),
+            (DataRootState::Missing, None)
+        );
+    }
+
+    #[test]
+    fn found_data_root_is_ready_and_echoes_the_resolved_path() {
+        assert_eq!(
+            classify_data_root(
+                SessionClient::VscodeExt,
+                Some(PathBuf::from("/tmp/ext-data")),
+                true
+            ),
+            (DataRootState::Ready, Some("/tmp/ext-data".to_string()))
+        );
+    }
+
+    #[test]
+    fn workbuddy_is_never_reported_missing_or_ready() {
+        // WorkBuddy 的数据在 ~/.workbuddy：没有独立数据根 ≠ 未安装。
+        assert_eq!(
+            classify_data_root(SessionClient::Workbuddy, None, false),
+            (DataRootState::NotApplicable, None)
+        );
+        // 即便共享根与客户端段都在，它也不该被当成「有独立数据根」的客户端。
+        assert_eq!(
+            classify_data_root(
+                SessionClient::Workbuddy,
+                Some(PathBuf::from("/tmp/x")),
+                true
+            ),
+            (DataRootState::NotApplicable, None)
+        );
+    }
+
+    #[test]
+    fn shared_root_without_client_segment_is_still_missing() {
+        // 本机现状：共享根由同产品其它客户端创建，里面没有本客户端的段 → 仍然是「没装」。
+        assert_eq!(
+            classify_data_root(
+                SessionClient::CodebuddyIde,
+                Some(PathBuf::from("/tmp/root")),
+                false
+            ),
+            (DataRootState::Missing, None)
+        );
+    }
+
+    #[test]
+    fn data_root_state_names_are_the_frontend_contract() {
+        assert_eq!(DataRootState::Ready.as_str(), "ready");
+        assert_eq!(DataRootState::Missing.as_str(), "missing");
+        assert_eq!(DataRootState::NotApplicable.as_str(), "notApplicable");
+    }
+
+    #[test]
+    fn client_data_probe_only_counts_safe_uid_segments_of_that_client() {
+        let root = std::env::temp_dir().join(format!(
+            "wb_switch_client_data_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(root.join("public").join("CodeBuddyIDE")).unwrap();
+        std::fs::create_dir_all(root.join("uid-alpha").join("VSCode")).unwrap();
+        assert!(!has_client_data(&root, CODEBUDDY_IDE_STORE));
+        assert!(has_client_data(&root, VSCODE_STORE));
+
+        std::fs::create_dir_all(root.join("uid-beta").join("CodeBuddyIDE")).unwrap();
+        assert!(has_client_data(&root, CODEBUDDY_IDE_STORE));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
