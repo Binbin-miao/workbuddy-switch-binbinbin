@@ -62,6 +62,7 @@ import * as api from "@/lib/api";
 import { getStackedSegmentVisualLayout } from "@/lib/stacked-bar-visuals";
 import type {
   TokenStatistics,
+  TokenStatsAvailability,
   TokenStatsGroup,
   TokenStatsRequestRow,
   TokenStatsSource,
@@ -77,13 +78,49 @@ const TOKEN_SOURCE_STORAGE_KEY = "wb-switch:token-stats:source";
 const RANKING_LIMIT = 10;
 const REQUEST_PAGE_SIZE = 50;
 
-function isSourceKey(value: unknown): value is SourceKey {
-  return (
-    value === "workbuddy" ||
-    value === "workbuddy-ai" ||
-    value === "codebuddy-cli" ||
-    value === "codebuddy-ide"
-  );
+/**
+ * 数据源 Tab 的唯一事实源：顺序、文案、图标都在这里，加第 6 个源只加一行。
+ * 置灰不由本表决定，而是看后端返回的 `availability`（见 `sourceAvailability`）。
+ */
+export const TOKEN_SOURCES = [
+  { key: "workbuddy", label: "WorkBuddy", Icon: WorkBuddyMark },
+  { key: "workbuddy-ai", label: "WorkBuddy 国际版", Icon: WorkBuddyAiMark },
+  { key: "codebuddy-cli", label: "CodeBuddy CLI", Icon: CodeBuddyMark },
+  { key: "codebuddy-ide", label: "CodeBuddy IDE / VS Code", Icon: CodeBuddyCnIdeMark },
+  { key: "codebuddy-jetbrains", label: "CodeBuddy 插件（JetBrains）", Icon: CodeBuddyCnIdeMark },
+] as const satisfies readonly {
+  key: SourceKey;
+  label: string;
+  Icon: typeof WorkBuddyMark;
+}[];
+
+export function isSourceKey(value: unknown): value is SourceKey {
+  return TOKEN_SOURCES.some((item) => item.key === value);
+}
+
+/**
+ * 某个数据源的可用性：没取到统计时为 `null`（不置灰）；统计已到但该源缺席，
+ * 说明后端根本没有这个源（旧后端），按 `not-installed` 处理。
+ */
+export function sourceAvailability(
+  stats: TokenStatistics | null,
+  key: SourceKey,
+): TokenStatsAvailability | null {
+  if (!stats) return null;
+  return stats.sources.find((item) => item.source === key)?.availability ?? "not-installed";
+}
+
+/** 空态文案按三态分流：没装 / 装了没数据 / 有数据但记录为 0。 */
+export function emptySourceMessage(source: TokenStatsSource): string {
+  if (source.availability === "not-installed") {
+    return "本机未检测到 CodeBuddy 数据目录（可忽略此栏）。";
+  }
+  if (source.availability === "no-data") {
+    return `已扫描 ${exact.format(source.filesScanned)} 个会话文件，但没有可用的 usage。`;
+  }
+  return source.filesScanned > 0
+    ? `已扫描 ${exact.format(source.filesScanned)} 个会话文件，但没有可用的 usage。`
+    : "尚未发现该来源的本地会话日志。";
 }
 
 function readPreferredTokenSource(): SourceKey {
@@ -1398,17 +1435,7 @@ function Dashboard({ source }: { source: TokenStatsSource }) {
   if (source.summary.records === 0) {
     return (
       <div className="rounded-xl border border-dashed px-4 py-16 text-center text-sm text-muted-foreground">
-        <div>
-          {source.filesScanned > 0
-            ? `已扫描 ${exact.format(source.filesScanned)} 个会话文件，但没有可用的 usage。`
-            : "尚未发现该来源的本地会话日志。"}
-        </div>
-        {source.source === "workbuddy-ai" && (
-          <div className="mt-2 text-xs leading-5">
-            国际版数据源为空：本机可能未安装 WorkBuddy 国际版客户端，或尚未产生本地会话日志；
-            国际版数据与国内版分开统计，不参与国内版用量。
-          </div>
-        )}
+        <div>{emptySourceMessage(source)}</div>
         {source.parseErrors > 0 && (
           <div className="mt-2 text-xs text-amber-600">
             已跳过 {exact.format(source.parseErrors)} 条无法解析的本地记录。
@@ -1759,43 +1786,23 @@ export default function TokenStatsPage() {
           value={active}
           onValueChange={(value) => {
             if (!isSourceKey(value)) return;
-            if (stats && !stats.sources.some((item) => item.source === value)) return;
+            // 置灰的 Tab 本就点不动；这里再守一层，挡住 localStorage 里残留的不可用源。
+            if (sourceAvailability(stats, value) === "not-installed") return;
             setActive(value);
           }}
         >
           <TabsList className="h-auto max-w-full flex-wrap" aria-label="Token 数据来源">
-            <TabsTrigger
-              className="max-w-full gap-2 whitespace-normal"
-              value="workbuddy"
-              disabled={Boolean(stats && !stats.sources.some((item) => item.source === "workbuddy"))}
-            >
-              <WorkBuddyMark size={16} />
-              WorkBuddy
-            </TabsTrigger>
-            <TabsTrigger
-              className="max-w-full gap-2 whitespace-normal"
-              value="workbuddy-ai"
-              disabled={Boolean(stats && !stats.sources.some((item) => item.source === "workbuddy-ai"))}
-            >
-              <WorkBuddyAiMark size={16} />
-              WorkBuddy 国际版
-            </TabsTrigger>
-            <TabsTrigger
-              className="max-w-full gap-2 whitespace-normal"
-              value="codebuddy-cli"
-              disabled={Boolean(stats && !stats.sources.some((item) => item.source === "codebuddy-cli"))}
-            >
-              <CodeBuddyMark size={16} />
-              CodeBuddy CLI
-            </TabsTrigger>
-            <TabsTrigger
-              className="max-w-full gap-2 whitespace-normal"
-              value="codebuddy-ide"
-              disabled={Boolean(stats && !stats.sources.some((item) => item.source === "codebuddy-ide"))}
-            >
-              <CodeBuddyCnIdeMark size={16} />
-              CodeBuddy IDE / VS Code
-            </TabsTrigger>
+            {TOKEN_SOURCES.map(({ key, label, Icon }) => (
+              <TabsTrigger
+                key={key}
+                className="max-w-full gap-2 whitespace-normal"
+                value={key}
+                disabled={sourceAvailability(stats, key) === "not-installed"}
+              >
+                <Icon size={16} />
+                {label}
+              </TabsTrigger>
+            ))}
           </TabsList>
         </Tabs>
       )}

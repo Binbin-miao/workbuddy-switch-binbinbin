@@ -80,6 +80,10 @@ pub struct MirrorPreview {
     pub experts_note: Option<String>,
     /// 执行前预登记的备份目录（预览阶段恒 null）。
     pub backup_dir: Option<String>,
+    /// 组层面的合并缺口，供界面折叠展示；只读派生，不参与 `expectedDigest` 与执行分支。
+    /// 旧后端不返回该键时按空清单处理。
+    #[serde(default)]
+    pub unmerged: Vec<MirrorUnmerged>,
 }
 
 /// 冻结的执行计划：作为 switchAccount 的独立参数并入 switch_account 主干（批次②③接线）。
@@ -129,6 +133,26 @@ pub struct MirrorReport {
     pub warnings: Vec<String>,
     pub skipped: Vec<MirrorSkipped>,
     pub errors: Vec<MirrorError>,
+    /// 本次执行后仍缺的组层面合并缺口（只读观测，不参与任何执行分支）。
+    /// 还原与删除同步没有该语义，恒为空清单；`#[serde(default)]` 兼容老载荷与老前端。
+    #[serde(default)]
+    pub unmerged: Vec<MirrorUnmerged>,
+}
+
+/// 组层面的合并缺口（只读观测）：母本在该组有存活 `Active` 成员，而目标账号在该组
+/// 没有任何 `Active` 成员。
+///
+/// 语义只有一条定义，预览采样时就是「待合并清单」，执行后再采样就是「仍缺清单」。
+/// 它**不参与** `expectedDigest`、token 绑定与任何执行分支，纯展示用。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MirrorUnmerged {
+    pub group_id: String,
+    /// 母本会话行的展示标题；母本行已不可读时为 `None`。
+    pub title: Option<String>,
+    pub mother_session_id: String,
+    /// 该组里缺 `Active` 成员的账号（当前恒为单个目标 uid）。
+    pub missing_uids: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -541,11 +565,13 @@ pub fn missing_mirror_session_ids(
         if mother_active.is_empty() {
             continue;
         }
-        let target_linked = group
+        // 语义是「目标是否**已登记**为 Active 成员」，不是「目标的副本是否还在」：
+        // 副本被用户删掉也照样跳过，尊重删除（与 `session.rs` 的 `member_is_valid` 不同口径）。
+        let target_registered = group
             .members
             .iter()
             .any(|member| member.uid == target_uid && member.state == MemberState::Active);
-        if target_linked {
+        if target_registered {
             continue;
         }
         ids.extend(
@@ -566,6 +592,55 @@ pub fn missing_mirror_session_ids(
     ids.sort();
     ids.dedup();
     ids
+}
+
+/// 组层面的合并缺口清单（只读派生，零 IO）。
+///
+/// 入选条件：母本在该组有 `Active` **且存活**的成员，而目标账号在该组**没有任何**
+/// `Active` 成员。两条排除规则按已拍板语义写死：
+/// - 目标已有 `Active` 成员（哪怕它的会话已被删）→ 不入选：对话已属于目标账号，
+///   「不补，尊重删除」；
+/// - 母本成员全部 superseded → 不入选：没有可作副本源的存活母本。
+///
+/// 同一输入重复调用逐字相同（按 `group_id` → `mother_session_id` 排序后去重）。
+pub fn unmerged_groups(
+    groups: &[LinkGroup],
+    mother_uid: &str,
+    target_uid: &str,
+    mother_states: &HashMap<String, Option<i64>>,
+    mother_titles: &HashMap<String, String>,
+) -> Vec<MirrorUnmerged> {
+    let mut unmerged: Vec<MirrorUnmerged> = Vec::new();
+    for group in groups {
+        let target_registered = group
+            .members
+            .iter()
+            .any(|member| member.uid == target_uid && member.state == MemberState::Active);
+        if target_registered {
+            continue;
+        }
+        for member in &group.members {
+            if member.uid != mother_uid || member.state != MemberState::Active {
+                continue;
+            }
+            if !is_alive(mother_states, &member.session_id) {
+                continue;
+            }
+            unmerged.push(MirrorUnmerged {
+                group_id: group.id.clone(),
+                title: mother_titles.get(&member.session_id).cloned(),
+                mother_session_id: member.session_id.clone(),
+                missing_uids: vec![target_uid.to_string()],
+            });
+        }
+    }
+    unmerged.sort_by(|left, right| {
+        left.group_id
+            .cmp(&right.group_id)
+            .then_with(|| left.mother_session_id.cmp(&right.mother_session_id))
+    });
+    unmerged.dedup();
+    unmerged
 }
 
 // ---------------------------------------------------------------------------
@@ -813,6 +888,18 @@ pub fn mirror_preview_at(
         &mother_states,
         &target_alive_ids,
     );
+    // 只读派生：复用同一次连接与同一份 `mother_states` 快照，不再第二次采样。
+    let mother_titles: HashMap<String, String> = read_target_rows(&conn, &mother_uid)?
+        .into_iter()
+        .map(|row| (row.session_id, display_title(row.title, row.custom_title)))
+        .collect();
+    let unmerged = unmerged_groups(
+        &groups,
+        &mother_uid,
+        &target_uid,
+        &mother_states,
+        &mother_titles,
+    );
 
     let binding = build_mirror_token_binding(
         variant,
@@ -847,6 +934,7 @@ pub fn mirror_preview_at(
         experts_note,
         targets,
         backup_dir: None,
+        unmerged,
     })
 }
 
@@ -1187,6 +1275,11 @@ pub fn mirror_apply_at(
     let target_alive_ids = alive_ids_of(&rows);
     let live_targets = mirror_targets_from_rows(&rows, target_uid, &mother_uid, &groups, &mother_states);
     let live_expected_digest = expected_digest_of(&live_targets);
+    // 母本行标题只采样一次：零操作分支与正式返回都要用它算「仍缺清单」，不重复读库。
+    let mother_titles: HashMap<String, String> = read_target_rows(&conn, &mother_uid)?
+        .into_iter()
+        .map(|row| (row.session_id, display_title(row.title, row.custom_title)))
+        .collect();
 
     // 硬门禁 2：expectedDigest 逐条重算，与计划不符 → 零写入。
     if live_expected_digest != plan.expected_digest {
@@ -1275,6 +1368,8 @@ pub fn mirror_apply_at(
             warnings: Vec::new(),
             skipped: Vec::new(),
             errors: experts_plan_error.into_iter().collect(),
+            // 零操作：什么都没改，当前缺口就是执行后的缺口。
+            unmerged: unmerged_groups(&groups, &mother_uid, target_uid, &mother_states, &mother_titles),
         });
     }
 
@@ -1351,6 +1446,11 @@ pub fn mirror_apply_at(
     // `errors` 单独表达为「部分未完成，备份已保留」。
     let needs_recovery = copy_needs_recovery;
 
+    // 执行后再读一次组存储（只读、单个 JSON 文件）才叫「仍缺」：复制成功的组已把目标
+    // 登记为 `Active` 成员，会自动从清单里消失。母本状态沿用本次唯一一次采样。
+    let groups_after = load_groups(paths);
+    let unmerged = unmerged_groups(&groups_after, &mother_uid, target_uid, &mother_states, &mother_titles);
+
     Ok(MirrorReport {
         deleted_sessions: deleted,
         copied_sessions: copied_entries.len(),
@@ -1362,6 +1462,7 @@ pub fn mirror_apply_at(
         warnings,
         skipped,
         errors,
+        unmerged,
     })
 }
 
@@ -1674,6 +1775,8 @@ pub fn mirror_restore_at(
         warnings,
         skipped,
         errors,
+        // 还原不是镜像合并，没有「仍缺清单」语义。
+        unmerged: Vec::new(),
     })
 }
 
@@ -1949,6 +2052,8 @@ pub fn deleted_sync_apply_at(
             warnings: Vec::new(),
             skipped: Vec::new(),
             errors: Vec::new(),
+            // 删除同步不涉及母本合并，没有「仍缺清单」语义。
+            unmerged: Vec::new(),
         });
     }
 
@@ -2017,6 +2122,8 @@ pub fn deleted_sync_apply_at(
         warnings,
         skipped,
         errors: Vec::new(),
+        // 删除同步不涉及母本合并，没有「仍缺清单」语义。
+        unmerged: Vec::new(),
     })
 }
 
@@ -2478,6 +2585,160 @@ mod tests {
             "缺列时母本行恒按 Alive → 不删：{:?}",
             preview.targets
         );
+    }
+
+    // --- t5：unmerged 只读观测（组层面合并缺口） ---------------------------
+
+    fn titles_of(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(id, title)| (id.to_string(), title.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn unmerged_groups_lists_group_where_only_mother_is_active() {
+        let groups = vec![group(
+            "g-gap",
+            vec![
+                ("u-mother", "s-m", MemberState::Active),
+                ("u-third", "s-third", MemberState::Active),
+            ],
+        )];
+        let unmerged = unmerged_groups(
+            &groups,
+            "u-mother",
+            "u-target",
+            &mother_states(&["s-m"], &[]),
+            &titles_of(&[("s-m", "母本标题")]),
+        );
+
+        assert_eq!(unmerged.len(), 1);
+        assert_eq!(unmerged[0].group_id, "g-gap");
+        assert_eq!(unmerged[0].mother_session_id, "s-m");
+        assert_eq!(unmerged[0].title.as_deref(), Some("母本标题"));
+        assert_eq!(unmerged[0].missing_uids, vec!["u-target".to_string()]);
+    }
+
+    /// B13：目标在该组已有 `Active` 记录（哪怕副本已删）→ 不进清单，尊重删除。
+    #[test]
+    fn unmerged_groups_skip_group_already_registered_to_target() {
+        let groups = vec![group(
+            "g-linked",
+            vec![
+                ("u-mother", "s-m", MemberState::Active),
+                ("u-target", "s-t", MemberState::Active),
+            ],
+        )];
+        let unmerged = unmerged_groups(
+            &groups,
+            "u-mother",
+            "u-target",
+            &mother_states(&["s-m"], &[("s-t", 5_000)]),
+            &HashMap::new(),
+        );
+
+        assert!(unmerged.is_empty(), "目标已登记的组不得列为未合并");
+    }
+
+    /// B12：母本在该组只有 superseded 成员 → 不进清单（没有可作源的存活母本）。
+    #[test]
+    fn unmerged_groups_skip_group_where_mother_is_only_superseded() {
+        let groups = vec![group(
+            "g-sup",
+            vec![("u-mother", "s-m", MemberState::Superseded)],
+        )];
+        let unmerged = unmerged_groups(
+            &groups,
+            "u-mother",
+            "u-target",
+            &mother_states(&["s-m"], &[]),
+            &HashMap::new(),
+        );
+
+        assert!(unmerged.is_empty(), "superseded 成员不得凑数");
+    }
+
+    /// 母本成员仍 Active 但会话已软删 → 不进清单（没有存活会话可复制）。
+    #[test]
+    fn unmerged_groups_skip_group_where_mother_session_is_deleted() {
+        let groups = vec![group(
+            "g-deleted",
+            vec![("u-mother", "s-m", MemberState::Active)],
+        )];
+        let unmerged = unmerged_groups(
+            &groups,
+            "u-mother",
+            "u-target",
+            &mother_states(&[], &[("s-m", 7_000)]),
+            &HashMap::new(),
+        );
+
+        assert!(unmerged.is_empty());
+    }
+
+    /// B11 + 幂等：空集返回空清单；同一输入重复调用结果逐字相同。
+    #[test]
+    fn unmerged_groups_is_empty_on_empty_input_and_stable_across_calls() {
+        assert!(unmerged_groups(&[], "u-mother", "u-target", &HashMap::new(), &HashMap::new()).is_empty());
+
+        let groups = vec![
+            group("g-b", vec![("u-mother", "s-b", MemberState::Active)]),
+            group("g-a", vec![("u-mother", "s-a", MemberState::Active)]),
+        ];
+        let states = mother_states(&["s-a", "s-b"], &[]);
+        let first = unmerged_groups(&groups, "u-mother", "u-target", &states, &HashMap::new());
+        let second = unmerged_groups(&groups, "u-mother", "u-target", &states, &HashMap::new());
+
+        assert_eq!(first, second);
+        assert_eq!(
+            first.iter().map(|item| item.group_id.as_str()).collect::<Vec<_>>(),
+            vec!["g-a", "g-b"],
+            "按 group_id 排序，结果可复现"
+        );
+    }
+
+    /// A10/A11/B11/B14：预览带出 `unmerged`，但它不进 `expectedDigest`，重复预览也不写盘。
+    #[test]
+    fn mirror_preview_reports_unmerged_without_touching_expected_digest() {
+        let dir = TempDir::new("unmerged-preview");
+        let paths = paths_for(&dir);
+        seed_auth(&paths, "u-mother");
+        seed_session_db(
+            &paths,
+            &[
+                ("s-m", "u-mother", 2_000, None),
+                ("s-gap", "u-mother", 2_100, None),
+                ("s-t", "u-target", 1_500, None),
+            ],
+        );
+        write_link_store(
+            &paths,
+            vec![
+                group(
+                    "g-linked",
+                    vec![
+                        ("u-mother", "s-m", MemberState::Active),
+                        ("u-target", "s-t", MemberState::Active),
+                    ],
+                ),
+                group("g-gap", vec![("u-mother", "s-gap", MemberState::Active)]),
+            ],
+        );
+        let target_acc = json!({ "uid": "u-target" });
+
+        let first =
+            mirror_preview_at(&paths, &paths.data_root, WbVariant::Cn, &target_acc).unwrap();
+        let second =
+            mirror_preview_at(&paths, &paths.data_root, WbVariant::Cn, &target_acc).unwrap();
+
+        assert_eq!(first.unmerged.len(), 1, "只有 g-gap 是缺口：{:?}", first.unmerged);
+        assert_eq!(first.unmerged[0].group_id, "g-gap");
+        assert_eq!(first.unmerged[0].title.as_deref(), Some("标题-s-gap"));
+        // 摘要只由 targets 决定：unmerged 若被折进去，这里会不等。
+        assert_eq!(first.expected_digest, expected_digest_of(&first.targets));
+        assert_eq!(first.expected_digest, second.expected_digest, "重复预览摘要不得漂移");
+        assert_eq!(first.unmerged, second.unmerged, "重复预览清单不得漂移");
     }
 
     // --- 红测 3：跨账号关联键判重（uid 精确匹配，绝不按标题） --------------

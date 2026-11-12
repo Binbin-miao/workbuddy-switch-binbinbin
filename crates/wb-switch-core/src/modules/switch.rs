@@ -172,6 +172,8 @@ fn mirror_report_json(result: Result<mirror::MirrorReport, String>) -> Value {
             session_id: String::new(),
             error,
         }],
+        // 镜像整体失败时没有可用快照，空清单是正确语义。
+        unmerged: Vec::new(),
     });
     serde_json::to_value(&report).unwrap_or(Value::Null)
 }
@@ -919,6 +921,7 @@ mod tests {
             warnings: Vec::new(),
             skipped: Vec::new(),
             errors: Vec::new(),
+            unmerged: Vec::new(),
         }));
         assert_eq!(ok["deletedSessions"], 3);
         assert_eq!(ok["backup"], "/x");

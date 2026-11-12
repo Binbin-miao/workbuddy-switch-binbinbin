@@ -573,7 +573,12 @@ impl SourceCollector {
         }
     }
 
-    fn into_value(mut self, name: &str, files_scanned: usize) -> Value {
+    fn into_value(
+        mut self,
+        name: &str,
+        files_scanned: usize,
+        availability: &'static str,
+    ) -> Value {
         let daily_by_model = self
             .daily_by_model
             .into_iter()
@@ -581,6 +586,7 @@ impl SourceCollector {
             .collect::<Map<String, Value>>();
         let mut value = json!({
             "source": name,
+            "availability": availability,
             "summary": self.total.value(),
             "models": groups(self.models),
             "projects": groups(self.projects),
@@ -612,19 +618,30 @@ impl SourceCollector {
 /// 单根测试夹具：生产路径统一走 `source_from_roots`（要带跨源进度）。
 #[cfg(test)]
 fn source(root: PathBuf, name: &str, cutoff: Option<i64>, detail: bool) -> Value {
-    source_from_roots(std::slice::from_ref(&root), name, cutoff, detail, None)
+    let root_exists = root.is_dir();
+    source_from_roots(
+        std::slice::from_ref(&root),
+        name,
+        cutoff,
+        detail,
+        None,
+        root_exists,
+    )
 }
 
 /// 多根合并统计：同一档位下的多个 jsonl 根合并成**一个** source。
 ///
 /// 国际版数据根与国内版不同构（实测无 `projects/`、只有 `sessions/`），因此按
 /// 「存在的根」探测；一个都不存在时返回空集且不报错（前端显示空状态）。
+/// `root_exists` 是「产品数据根是否存在」的现场快照：它区分「没装」（不存在的根
+/// 被上游过滤，这里没有信息）与「装了但还没写过日志」。
 fn source_from_roots(
     roots: &[PathBuf],
     name: &str,
     cutoff: Option<i64>,
     detail: bool,
     scan: Option<&ScanProgress<'_>>,
+    root_exists: bool,
 ) -> Value {
     let mut paths: Vec<(PathBuf, ScannedFile)> = Vec::new();
     for root in roots {
@@ -771,7 +788,22 @@ fn source_from_roots(
     }
 
     collector.attach_sidecar_totals();
-    collector.into_value(name, paths.len())
+    let availability = availability_label(root_exists, paths.len(), collector.total.records);
+    collector.into_value(name, paths.len(), availability)
+}
+
+/// 数据源可用性三态：没装 / 装了没数据 / 有数据。
+///
+/// 三态互斥，前端据它决定 Tab 是否置灰与空态文案；用一个布尔拼状态会让
+/// 「目录不存在」与「目录存在但零 usage」无法区分。
+fn availability_label(root_exists: bool, files_scanned: usize, records: u64) -> &'static str {
+    if !root_exists {
+        return "not-installed";
+    }
+    if files_scanned == 0 || records == 0 {
+        return "no-data";
+    }
+    "ready"
 }
 
 /// 某档位的候选 jsonl 根（顺序固定；纯函数，便于单测）。
@@ -798,6 +830,14 @@ fn codebuddy_extension_data_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
         .join("CodeBuddyExtension")
         .join("Data")
+}
+
+/// JetBrains 插件的会话根：每个装了 CodeBuddy 插件的 JetBrains 产品一个根。
+///
+/// 路径知识全部收在 `jetbrains` 模块里（同一个插件安装目录也用于登录态写入），
+/// 这里只做转发，不复制「配置根/插件目录」的拼装规则。零命中返回空列表。
+fn jetbrains_session_roots() -> Vec<PathBuf> {
+    crate::modules::jetbrains::jetbrains_plugin_dirs()
 }
 
 fn is_ide_conversation_index(path: &Path) -> bool {
@@ -1069,15 +1109,18 @@ fn collect_ide_requests(
     }
 }
 
+/// 把多个会话根的 index.json 都收进同一份统计（IDE 副本散落在不同插件目录时按并集算）。
 fn ide_source(
-    root: PathBuf,
+    roots: &[PathBuf],
     name: &str,
     cutoff: Option<i64>,
     project_by_session: &HashMap<String, String>,
     scan: Option<&ScanProgress<'_>>,
 ) -> Value {
     let mut paths = Vec::new();
-    ide_index_files(&root, &mut paths);
+    for root in roots {
+        ide_index_files(root, &mut paths);
+    }
     paths.sort();
 
     // 同一会话（按起点请求判身份）因切号复制可能散落在多个账号数据目录里。各份之间按
@@ -1162,7 +1205,12 @@ fn ide_source(
         collector.push_session(lead_session_id, title, project, session_totals);
     }
 
-    collector.into_value(name, paths.len())
+    let availability = availability_label(
+        roots.iter().any(|root| root.is_dir()),
+        paths.len(),
+        collector.total.records,
+    );
+    collector.into_value(name, paths.len(), availability)
 }
 
 /// 扫描进度回调：`(已扫描文件数, 待扫描文件总数)`。
@@ -1228,8 +1276,17 @@ fn count_files(roots: &[PathBuf]) -> usize {
     found.len()
 }
 
-/// Return independent WorkBuddy (CN), WorkBuddy AI, CodeBuddy CLI, and
-/// CodeBuddy IDE aggregates.
+/// 预枚举分母（IDE 侧）：与 `ide_source` 内部用同一个 `ide_index_files` 口径。
+fn count_ide_index_files(roots: &[PathBuf]) -> usize {
+    let mut found = Vec::new();
+    for root in roots {
+        ide_index_files(root, &mut found);
+    }
+    found.len()
+}
+
+/// Return independent WorkBuddy (CN), WorkBuddy AI, CodeBuddy CLI,
+/// CodeBuddy IDE, and CodeBuddy JetBrains-plugin aggregates.
 /// `days` is interpreted in Rust using the same millisecond clock for every source.
 pub fn get_statistics(days: Option<i64>) -> Value {
     get_statistics_with_progress(days, None)
@@ -1252,13 +1309,16 @@ pub fn get_statistics_with_progress(
 
     let cn_roots = variant_source_roots(WbVariant::Cn);
     let ai_roots = variant_source_roots(WbVariant::Ai);
-    let cli_roots = [home.join(".codebuddy/projects")];
+    let cli_root = home.join(".codebuddy/projects");
+    let cli_roots = [cli_root.clone()];
     let ide_root = codebuddy_extension_data_dir();
-    let mut ide_paths = Vec::new();
-    ide_index_files(&ide_root, &mut ide_paths);
+    let jb_roots = jetbrains_session_roots();
 
-    let total =
-        count_files(&cn_roots) + count_files(&ai_roots) + count_files(&cli_roots) + ide_paths.len();
+    let total = count_files(&cn_roots)
+        + count_files(&ai_roots)
+        + count_files(&cli_roots)
+        + count_ide_index_files(std::slice::from_ref(&ide_root))
+        + count_ide_index_files(&jb_roots);
     let scan = progress.map(|callback| ScanProgress::new(callback, total));
     let scan_ref = scan.as_ref();
 
@@ -1267,15 +1327,51 @@ pub fn get_statistics_with_progress(
         "generatedAt": generated_at,
         "rangeDays": range_days,
         "sources": [
-            source_from_roots(&cn_roots, "workbuddy", cutoff, false, scan_ref),
+            source_from_roots(
+                &cn_roots,
+                "workbuddy",
+                cutoff,
+                false,
+                scan_ref,
+                WbVariant::Cn.data_root().is_dir(),
+            ),
             // 国际版独立 source：不与国内版混算（不同账号体系）。
-            source_from_roots(&ai_roots, "workbuddy-ai", cutoff, false, scan_ref),
+            source_from_roots(
+                &ai_roots,
+                "workbuddy-ai",
+                cutoff,
+                false,
+                scan_ref,
+                WbVariant::Ai.data_root().is_dir(),
+            ),
             // 请求明细目前只对 CodeBuddy CLI 开放（见 spec 的 requests 契约）。
-            source_from_roots(&cli_roots, "codebuddy-cli", cutoff, true, scan_ref),
-            ide_source(ide_root, "codebuddy-ide", cutoff, &ide_projects, scan_ref),
+            source_from_roots(
+                &cli_roots,
+                "codebuddy-cli",
+                cutoff,
+                true,
+                scan_ref,
+                cli_root.is_dir(),
+            ),
+            ide_source(
+                std::slice::from_ref(&ide_root),
+                "codebuddy-ide",
+                cutoff,
+                &ide_projects,
+                scan_ref,
+            ),
+            // JetBrains 插件是独立 source：根在 `%APPDATA%/JetBrains/.../plugins`，
+            // 与 `codebuddy-ide` 的 `%LOCALAPPDATA%/CodeBuddyExtension/Data` 不重叠。
+            ide_source(
+                &jb_roots,
+                "codebuddy-jetbrains",
+                cutoff,
+                &ide_projects,
+                scan_ref,
+            ),
         ],
     });
-    // 四个 source 全部扫完后无条件收口：预枚举分母与第二次枚举的分子之间
+    // 全部 source 扫完后无条件收口：预枚举分母与第二次枚举的分子之间
     // 存在 TOCTOU 窗口，日志变少时末帧会停在 99%，见 [`ScanProgress::finish`]。
     if let Some(scan) = &scan {
         scan.finish();
@@ -1805,7 +1901,7 @@ mod tests {
         for timestamp in 0..(REQUEST_WINDOW as i64 + 100) {
             bounded.push_request(row(timestamp));
         }
-        let value = bounded.into_value("fixture", 1);
+        let value = bounded.into_value("fixture", 1, "ready");
         let rows = value["requests"].as_array().expect("request rows");
         assert_eq!(rows.len(), REQUEST_WINDOW);
         assert_eq!(rows[0]["timestamp"], REQUEST_WINDOW as i64 + 99);
@@ -1814,7 +1910,10 @@ mod tests {
         // 关闭明细采集时不缓存任何行，也不输出 requests 键。
         let mut off = SourceCollector::default();
         off.push_request(row(1));
-        assert!(off.into_value("fixture", 1).get("requests").is_none());
+        assert!(off
+            .into_value("fixture", 1, "ready")
+            .get("requests")
+            .is_none());
     }
 
     #[test]
@@ -1848,7 +1947,7 @@ mod tests {
             collector.push_request(row(timestamp));
         }
 
-        let value = collector.into_value("fixture", 1);
+        let value = collector.into_value("fixture", 1, "ready");
         let rows = value["requests"].as_array().expect("request rows");
         assert_eq!(rows.len(), REQUEST_WINDOW);
         assert_eq!(rows[0]["timestamp"], 10_099);
@@ -2192,7 +2291,7 @@ mod tests {
         let mut projects = HashMap::new();
         projects.insert("conv-a".to_string(), "example-project".to_string());
         let result = ide_source(
-            root.clone(),
+            std::slice::from_ref(&root),
             "codebuddy-ide",
             Some(now - 50_000),
             &projects,
@@ -2200,6 +2299,7 @@ mod tests {
         );
 
         assert_eq!(result["source"], "codebuddy-ide");
+        assert_eq!(result["availability"], "ready");
         assert_eq!(result["filesScanned"], 2);
         assert_eq!(result["summary"]["records"], 1);
         assert_eq!(result["summary"]["input"], 100);
@@ -2276,7 +2376,13 @@ mod tests {
         )
         .expect("write forked conversation");
 
-        let result = ide_source(root.clone(), "codebuddy-ide", None, &HashMap::new(), None);
+        let result = ide_source(
+            std::slice::from_ref(&root),
+            "codebuddy-ide",
+            None,
+            &HashMap::new(),
+            None,
+        );
 
         assert_eq!(result["filesScanned"], 3);
         // 并集：100 + 200 + 400；重放的 req-1 只算一次，分叉两边独有的请求都在。
@@ -2299,7 +2405,7 @@ mod tests {
     }
 
     #[test]
-    fn get_statistics_returns_four_isolated_sources() {
+    fn get_statistics_returns_five_isolated_sources() {
         let value = get_statistics(None);
         let sources = value["sources"].as_array().expect("sources");
         let names: Vec<_> = sources
@@ -2312,23 +2418,170 @@ mod tests {
                 "workbuddy",
                 "workbuddy-ai",
                 "codebuddy-cli",
-                "codebuddy-ide"
+                "codebuddy-ide",
+                "codebuddy-jetbrains"
             ]
         );
         // 国际版与国内版是两个独立 source，不合并。
         assert_ne!(sources[0]["source"], sources[1]["source"]);
+        // 每个 source 都带三态可用性，且只会是三者之一。
+        for source in sources {
+            let availability = source["availability"].as_str().expect("availability");
+            assert!(
+                matches!(availability, "ready" | "no-data" | "not-installed"),
+                "{availability} 不是合法可用性"
+            );
+        }
     }
 
     /// 国际版数据根缺少 jsonl 根时返回空集，不报错。
     #[test]
     fn ai_source_is_empty_and_error_free_when_roots_are_missing() {
-        let value = source_from_roots(&[], "workbuddy-ai", None, false, None);
+        let value = source_from_roots(&[], "workbuddy-ai", None, false, None, false);
         assert_eq!(value["source"], "workbuddy-ai");
+        assert_eq!(value["availability"], "not-installed");
         assert_eq!(value["filesScanned"], 0);
         assert_eq!(value["summary"]["input"], 0);
         assert_eq!(value["parseErrors"], 0);
         assert_eq!(value["sessions"].as_array().map(Vec::len), Some(0));
         assert_eq!(value["projects"].as_array().map(Vec::len), Some(0));
+    }
+
+    /// 根存在但一个 jsonl 都没有 → 「装了没数据」，不能报「没装」（B3 的 jsonl 同形）。
+    #[test]
+    fn source_with_existing_root_and_no_files_is_no_data() {
+        let value = source_from_roots(&[], "workbuddy", None, false, None, true);
+        assert_eq!(value["availability"], "no-data");
+        assert_eq!(value["filesScanned"], 0);
+    }
+
+    fn jetbrains_fixture_dir(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "wb-switch-token-stats-jb-{tag}-{}-{}",
+            std::process::id(),
+            crate::modules::config::now_ms()
+        ))
+    }
+
+    /// JetBrains 插件的会话索引落在
+    /// `<配置根>/<产品><版本>/plugins/coding-copilot-*/…/history/<workspace>/<会话>/index.json`。
+    fn plugin_conversation(config_root: &PathBuf, config_dir: &str, conv: &str) -> PathBuf {
+        config_root
+            .join(config_dir)
+            .join("plugins")
+            .join("coding-copilot-jetbrains")
+            .join("src")
+            .join("history")
+            .join("workspace-hash")
+            .join(conv)
+    }
+
+    fn conversation_index(input: u64) -> String {
+        json!({
+            "requests": [{
+                "id": "req-1",
+                "state": "complete",
+                "startedAt": crate::modules::config::now_ms(),
+                "usage": {
+                    "inputTokens": input,
+                    "outputTokens": 0,
+                    "cacheTokens": 0,
+                    "cachedWriteTokens": 0
+                }
+            }]
+        })
+        .to_string()
+    }
+
+    /// A2 + A3：插件会话被扫到并判 `ready`；`<产品><版本>-backup` 迁移残留目录不进结果。
+    #[test]
+    fn jetbrains_source_scans_plugin_history_and_reports_ready() {
+        let base = jetbrains_fixture_dir("ready");
+        let config_root = base.join("JetBrains");
+        let conversation = plugin_conversation(&config_root, "PyCharm2026.2", "conv-jb");
+        let backup_conversation = plugin_conversation(&config_root, "PyCharm2026.2-backup", "conv-bk");
+        fs::create_dir_all(&conversation).expect("create plugin conversation dir");
+        fs::create_dir_all(&backup_conversation).expect("create backup conversation dir");
+        fs::write(conversation.join("index.json"), conversation_index(42))
+            .expect("write plugin conversation");
+        fs::write(backup_conversation.join("index.json"), conversation_index(999))
+            .expect("write backup conversation");
+
+        let roots = crate::modules::jetbrains::jetbrains_plugin_dirs_under(&config_root);
+        assert_eq!(roots.len(), 1, "-backup 残留目录必须被排除");
+
+        let value = ide_source(&roots, "codebuddy-jetbrains", None, &HashMap::new(), None);
+        assert_eq!(value["source"], "codebuddy-jetbrains");
+        assert_eq!(value["filesScanned"], 1);
+        assert_eq!(value["availability"], "ready");
+        assert_eq!(value["summary"]["records"], 1);
+        assert_eq!(value["summary"]["input"], 42, "backup 目录不得被计入");
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// B1 + B2：没装 JetBrains 和「装了 IDE 没装插件」都判 `not-installed`，全 0 不报错。
+    #[test]
+    fn jetbrains_source_without_plugin_dirs_is_not_installed() {
+        let base = jetbrains_fixture_dir("absent");
+        let config_root = base.join("JetBrains");
+        fs::create_dir_all(config_root.join("PyCharm2026.2")).expect("create product dir");
+
+        let no_ide = crate::modules::jetbrains::jetbrains_plugin_dirs_under(&base.join("NoSuchIde"));
+        let no_plugin = crate::modules::jetbrains::jetbrains_plugin_dirs_under(&config_root);
+        assert!(no_ide.is_empty(), "配置根不存在即零命中");
+        assert!(no_plugin.is_empty(), "没有 plugins/coding-copilot* 即零命中");
+
+        for roots in [no_ide, no_plugin] {
+            let value = ide_source(&roots, "codebuddy-jetbrains", None, &HashMap::new(), None);
+            assert_eq!(value["availability"], "not-installed");
+            assert_eq!(value["filesScanned"], 0);
+            assert_eq!(value["summary"]["records"], 0);
+            assert_eq!(value["summary"]["input"], 0);
+        }
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// B3：插件装了但一个会话索引都没有 → `no-data`（不能判「没装」）。
+    #[test]
+    fn jetbrains_source_with_plugin_but_no_index_files_is_no_data() {
+        let base = jetbrains_fixture_dir("nofiles");
+        let config_root = base.join("JetBrains");
+        let plugin = config_root
+            .join("IdeaIC2026.1")
+            .join("plugins")
+            .join("coding-copilot-jetbrains");
+        fs::create_dir_all(plugin.join("src")).expect("create plugin dir");
+
+        let roots = crate::modules::jetbrains::jetbrains_plugin_dirs_under(&config_root);
+        assert_eq!(roots.len(), 1, "插件目录存在即算装了");
+
+        let value = ide_source(&roots, "codebuddy-jetbrains", None, &HashMap::new(), None);
+        assert_eq!(value["availability"], "no-data");
+        assert_eq!(value["filesScanned"], 0);
+        assert_eq!(value["summary"]["records"], 0);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// B4：扫到索引文件但里面没有可用 usage → 仍 `no-data`，但 `filesScanned` 如实为 1。
+    #[test]
+    fn jetbrains_source_with_index_without_usage_is_no_data() {
+        let base = jetbrains_fixture_dir("nousage");
+        let config_root = base.join("JetBrains");
+        let conversation = plugin_conversation(&config_root, "IntelliJIdea2026.2", "conv-empty");
+        fs::create_dir_all(&conversation).expect("create plugin conversation dir");
+        fs::write(conversation.join("index.json"), json!({ "requests": [] }).to_string())
+            .expect("write empty conversation");
+
+        let roots = crate::modules::jetbrains::jetbrains_plugin_dirs_under(&config_root);
+        let value = ide_source(&roots, "codebuddy-jetbrains", None, &HashMap::new(), None);
+        assert_eq!(value["availability"], "no-data");
+        assert_eq!(value["filesScanned"], 1);
+        assert_eq!(value["summary"]["records"], 0);
+
+        let _ = fs::remove_dir_all(&base);
     }
 
     /// 多根共享同一个指纹集：国际版两个根之间重放的同一请求只计一次，
@@ -2385,6 +2638,7 @@ mod tests {
             None,
             false,
             None,
+            true,
         );
         // 两个根都被扫到；重放记录计一次，第二个根的新记录另计一次。
         assert_eq!(result["filesScanned"], 2);
@@ -2452,6 +2706,7 @@ mod tests {
             None,
             false,
             Some(&scan),
+            true,
         );
 
         let frames = seen.borrow();

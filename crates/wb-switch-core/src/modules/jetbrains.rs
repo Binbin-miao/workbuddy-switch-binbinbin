@@ -134,6 +134,37 @@ fn plugin_dir(config_dir: &Path) -> Option<PathBuf> {
     None
 }
 
+/// 本机各 JetBrains 产品下已安装的 CodeBuddy 插件目录（登录态与插件会话都落在这里）。
+///
+/// 只读枚举：`read_dir` 失败（没装 JetBrains / 无权限）等同于零命中，不创建任何目录。
+pub fn jetbrains_plugin_dirs() -> Vec<PathBuf> {
+    let Some(root) = jetbrains_config_root() else {
+        return Vec::new();
+    };
+    jetbrains_plugin_dirs_under(&root)
+}
+
+/// [`jetbrains_plugin_dirs`] 的可注入版本：把「配置根」作为参数，便于用临时目录断言
+/// 「受支持产品目录被收、`<产品><版本>-backup` 残留被排除」。
+pub(crate) fn jetbrains_plugin_dirs_under(config_root: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(config_root) else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(is_supported_config_dir_name)
+        })
+        .filter_map(|path| plugin_dir(&path))
+        .collect();
+    dirs.sort();
+    dirs
+}
+
 /// secret-storage.xml 路径。
 fn secret_path_for(config_dir: &Path) -> PathBuf {
     config_dir.join(SECRET_RELATIVE)

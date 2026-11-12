@@ -6,6 +6,7 @@
 // Windows 映像名/路径辅助在非 Windows 上只供单测使用。
 #![cfg_attr(not(target_os = "windows"), allow(dead_code))]
 
+use std::collections::HashSet;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -407,33 +408,117 @@ fn windows_workbuddy_process_rows(variant: WbVariant) -> Vec<WindowsProcessRow> 
         .collect()
 }
 
-#[cfg(target_os = "windows")]
-fn is_windows_pid_running(pid: u32) -> bool {
-    let filter = format!("PID eq {pid}");
-    match run_cmd_timeout("tasklist", &["/FI", &filter, "/FO", "CSV", "/NH"], 5) {
-        Some(out) => parse_tasklist_csv(&String::from_utf8_lossy(&out.stdout))
-            .iter()
-            .any(|r| r.pid == pid),
-        None => true,
-    }
+/// 等待一轮的观测结果：`alive` 是确认还活着的 PID，`unobservable` 是**查不清**的 PID。
+///
+/// 两者必须分开：`unobservable` 既不是「还在」也不是「已退出」，混进任一侧都会
+/// 把「查询失败」伪装成「进程顽固」或「进程已关闭」。
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct WaitOutcome {
+    pub alive: Vec<u32>,
+    pub unobservable: Vec<u32>,
 }
 
+/// 等待期间的轮询间隔。
+const PID_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// 从一次全表快照里挑出「在快照内 **且** 满足 `accept`」的 PID。
+///
+/// 纯函数：PID 会被系统复用，只比 PID 会把别人的进程当成 WorkBuddy；只比映像名
+/// 又会把本次新起的目标进程算进来。两个条件同时成立才判存活。
+fn alive_snapshot_pids(
+    rows: &[WindowsProcessRow],
+    snapshot: &HashSet<u32>,
+    accept: impl Fn(&WindowsProcessRow) -> bool,
+) -> Vec<u32> {
+    let mut alive: Vec<u32> = rows
+        .iter()
+        .filter(|row| snapshot.contains(&row.pid) && accept(row))
+        .map(|row| row.pid)
+        .collect();
+    alive.sort_unstable();
+    alive.dedup();
+    alive
+}
+
+/// 一次全表枚举（`tasklist /FO CSV /NH`，不带 IMAGENAME 过滤）。
+///
+/// 查询失败（spawn 失败 / 5s 超时 / 非 0 退出码）必须返回 `Err`，不许折叠成「还活着」。
 #[cfg(target_os = "windows")]
-pub(crate) fn wait_windows_pids_gone(pids: &[u32], timeout: Duration) -> Vec<u32> {
+fn tasklist_snapshot() -> Result<Vec<WindowsProcessRow>, String> {
+    let out = run_cmd_timeout("tasklist", &["/FO", "CSV", "/NH"], 5)
+        .ok_or_else(|| "tasklist 查询超时或无法启动".to_string())?;
+    if !out.status.success() {
+        return Err(format!("tasklist 退出码 {:?}", out.status.code()));
+    }
+    Ok(parse_tasklist_csv(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// 轮询直到 `pids` 全部消失，或超时，或查询连续两次失败。
+///
+/// - `pids` 为空 → 立即返回，**一次查询都不发**（客户端本来没运行）。
+/// - 每轮只调用一次 `observe()`（一次全表查询），失败重试 1 次；两次都失败 →
+///   计入 `unobservable` 并立即返回，绝不当成存活，也不判「顽固」。
+pub(crate) fn wait_pids_gone(
+    pids: &[u32],
+    timeout: Duration,
+    observe: &dyn Fn() -> Result<Vec<u32>, String>,
+) -> WaitOutcome {
     if pids.is_empty() {
-        return Vec::new();
+        return WaitOutcome::default();
     }
     let deadline = Instant::now() + timeout;
     loop {
-        let alive: Vec<u32> = pids
-            .iter()
-            .copied()
-            .filter(|pid| is_windows_pid_running(*pid))
+        let Ok(observed) = observe().or_else(|_| observe()) else {
+            return WaitOutcome {
+                alive: Vec::new(),
+                unobservable: pids.to_vec(),
+            };
+        };
+        let alive: Vec<u32> = observed
+            .into_iter()
+            .filter(|pid| pids.contains(pid))
             .collect();
         if alive.is_empty() || Instant::now() >= deadline {
-            return alive;
+            return WaitOutcome {
+                alive,
+                unobservable: Vec::new(),
+            };
         }
-        std::thread::sleep(Duration::from_millis(500));
+        std::thread::sleep(PID_POLL_INTERVAL);
+    }
+}
+
+/// WorkBuddy 关闭路径专用：PID ∈ 快照 **且** 映像名命中本档位才算还活着。
+#[cfg(target_os = "windows")]
+pub(crate) fn wait_workbuddy_pids_gone(
+    pids: &[u32],
+    variant: WbVariant,
+    timeout: Duration,
+) -> WaitOutcome {
+    let snapshot: HashSet<u32> = pids.iter().copied().collect();
+    wait_pids_gone(pids, timeout, &|| {
+        let rows = tasklist_snapshot()?;
+        Ok(alive_snapshot_pids(&rows, &snapshot, |row| {
+            is_workbuddy_image_name(&row.name, variant)
+        }))
+    })
+}
+
+/// 其它模块（CodeBuddy CLI/IDE 关自己的进程）沿用的旧契约：只按 PID 判存活。
+///
+/// 签名与返回值形态保持不变，只把「每个 PID 各查一次`tasklist`」换成每轮一次全表查询；
+/// 查询连续两次失败仍按「还在运行」上报，由调用方原有的超时/报错逻辑兜住。
+#[cfg(target_os = "windows")]
+pub(crate) fn wait_windows_pids_gone(pids: &[u32], timeout: Duration) -> Vec<u32> {
+    let snapshot: HashSet<u32> = pids.iter().copied().collect();
+    let outcome = wait_pids_gone(pids, timeout, &|| {
+        let rows = tasklist_snapshot()?;
+        Ok(alive_snapshot_pids(&rows, &snapshot, |_| true))
+    });
+    if outcome.unobservable.is_empty() {
+        outcome.alive
+    } else {
+        pids.to_vec()
     }
 }
 
@@ -1132,6 +1217,116 @@ pub fn close_workbuddy(variant: WbVariant, timeout_secs: i64) -> Result<(), Stri
     }
 }
 
+/// 一次 `taskkill` 失败：退出码 + stderr 尾巴。
+///
+/// 旧实现用 `let _ =` 丢弃 `Output`，于是「拒绝访问」与「目标不存在」都变成同一句
+/// 泛化文案；保留这两项，上层才能分出「权限」与「顽固」。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct KillFailure {
+    pub pid: u32,
+    pub exit_code: Option<i32>,
+    pub stderr_tail: String,
+}
+
+/// stderr 尾巴长度上限：够看清「拒绝访问 / 没有找到进程」，又不至于把整段帮助刷进界面。
+const STDERR_TAIL_CHARS: usize = 400;
+
+fn tail_of(text: &str) -> String {
+    let trimmed = text.trim();
+    let chars: Vec<char> = trimmed.chars().collect();
+    if chars.len() <= STDERR_TAIL_CHARS {
+        return trimmed.to_string();
+    }
+    chars[chars.len() - STDERR_TAIL_CHARS..].iter().collect()
+}
+
+/// `taskkill` 是否因权限被拒（中英双语 stderr 都算）。
+fn is_access_denied(failure: &KillFailure) -> bool {
+    let stderr = failure.stderr_tail.to_lowercase();
+    stderr.contains("拒绝访问") || stderr.contains("access is denied") || stderr.contains("access denied")
+}
+
+/// 关闭失败的可读文案：三档互斥地说明「权限 / 顽固 / 无法确认」，并附 stderr 尾巴。
+///
+/// 只在边界处拼装：`close_workbuddy` 的公开签名因此不必变化。
+fn close_failure_message(outcome: &WaitOutcome, failures: &[KillFailure]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if !outcome.unobservable.is_empty() {
+        parts.push(format!(
+            "无法确认进程状态，tasklist 连续失败（PID {:?}）",
+            outcome.unobservable
+        ));
+    }
+    let denied: Vec<&KillFailure> = failures.iter().filter(|f| is_access_denied(f)).collect();
+    if !denied.is_empty() {
+        let detail: Vec<String> = denied
+            .iter()
+            .map(|f| format!("PID {}（退出码 {:?}）", f.pid, f.exit_code))
+            .collect();
+        parts.push(format!(
+            "权限不足，taskkill 被拒绝 {}：可能 WorkBuddy 以管理员身份运行，请以管理员身份重试",
+            detail.join("、")
+        ));
+    }
+    if !outcome.alive.is_empty() {
+        parts.push(format!(
+            "进程真顽固，强杀后仍在运行（PID {:?}）",
+            outcome.alive
+        ));
+    }
+    if parts.is_empty() {
+        parts.push("进程是否已退出未能确认".to_string());
+    }
+    let mut message = format!("WorkBuddy 进程无法关闭：{}", parts.join("；"));
+    if let Some(tail) = failures
+        .iter()
+        .map(|failure| failure.stderr_tail.trim())
+        .find(|tail| !tail.is_empty())
+    {
+        message.push_str(&format!("。taskkill 输出：{tail}"));
+    }
+    message.push_str("。请手动结束 WorkBuddy/CodeBuddy 进程");
+    message
+}
+
+#[cfg(target_os = "windows")]
+fn taskkill_pid(pid: u32, force: bool) -> Option<Output> {
+    let pid_s = pid.to_string();
+    if force {
+        run_cmd_timeout("taskkill", &["/PID", &pid_s, "/T", "/F"], 10)
+    } else {
+        run_cmd_timeout("taskkill", &["/PID", &pid_s, "/T"], 10)
+    }
+}
+
+/// 逐个 PID `taskkill`，只把**失败**的收进结果（超时也算失败，但退出码为 `None`）。
+#[cfg(target_os = "windows")]
+fn kill_pids(pids: &[u32], force: bool) -> Vec<KillFailure> {
+    let mut failures = Vec::new();
+    for pid in pids {
+        let output = taskkill_pid(*pid, force);
+        let failed = output
+            .as_ref()
+            .is_none_or(|output| !output.status.success());
+        if !failed {
+            continue;
+        }
+        let (exit_code, stderr_tail) = match &output {
+            Some(output) => (
+                output.status.code(),
+                tail_of(&String::from_utf8_lossy(&output.stderr)),
+            ),
+            None => (None, "taskkill 超时或无法启动".to_string()),
+        };
+        failures.push(KillFailure {
+            pid: *pid,
+            exit_code,
+            stderr_tail,
+        });
+    }
+    failures
+}
+
 /// 先对目标 PID `taskkill /PID /T`（无 /F），超时再 `/F`；按 PID 等待，不按名称子串。
 #[cfg(target_os = "windows")]
 fn close_workbuddy_windows(variant: WbVariant, timeout_secs: i64) -> Result<(), String> {
@@ -1140,31 +1335,29 @@ fn close_workbuddy_windows(variant: WbVariant, timeout_secs: i64) -> Result<(), 
         return Ok(());
     }
     let pids: Vec<u32> = rows.iter().map(|r| r.pid).collect();
-    for pid in &pids {
-        let pid_s = pid.to_string();
-        let _ = run_cmd_timeout("taskkill", &["/PID", &pid_s, "/T"], 10);
-    }
+    let mut failures = kill_pids(&pids, false);
 
     let started = Instant::now();
     let timeout = Duration::from_secs(timeout_secs.max(1) as u64);
     let graceful_budget = Duration::from_secs(8).min(timeout);
-    let remaining = wait_windows_pids_gone(&pids, graceful_budget);
-    if remaining.is_empty() {
+    let outcome = wait_workbuddy_pids_gone(&pids, variant, graceful_budget);
+    // 查不清就直说「无法确认」，既不当成功也不判顽固。
+    if !outcome.unobservable.is_empty() {
+        return Err(close_failure_message(&outcome, &failures));
+    }
+    if outcome.alive.is_empty() {
         return Ok(());
     }
 
-    for pid in &remaining {
-        let pid_s = pid.to_string();
-        let _ = run_cmd_timeout("taskkill", &["/PID", &pid_s, "/T", "/F"], 10);
-    }
+    failures.extend(kill_pids(&outcome.alive, true));
     let rest = timeout
         .saturating_sub(started.elapsed())
         .max(Duration::from_secs(1));
-    let leftover = wait_windows_pids_gone(&remaining, rest);
-    if leftover.is_empty() {
+    let leftover = wait_workbuddy_pids_gone(&outcome.alive, variant, rest);
+    if leftover.alive.is_empty() && leftover.unobservable.is_empty() {
         return Ok(());
     }
-    Err("WorkBuddy 进程无法关闭，请手动结束 WorkBuddy/CodeBuddy 进程".to_string())
+    Err(close_failure_message(&leftover, &failures))
 }
 
 /// 启动 WorkBuddy。失败返回可读错误。对照 `launch_workbuddy`。
@@ -2076,5 +2269,142 @@ D:\Users\Zhou\AppData\Local\Programs\WorkBuddy\WorkBuddy.exe
 
         assert!(!is_app_bundle(&dir.join("missing.app"))); // 不存在
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// 注入的 tasklist CSV：`Image Name,PID,...`
+    const SNAPSHOT_CSV: &str = "\
+\"WorkBuddy.exe\",\"4242\",\"Console\",\"1\",\"120,000 K\"
+\"chrome.exe\",\"4243\",\"Console\",\"1\",\"80,000 K\"
+\"WorkBuddy.exe\",\"9999\",\"Console\",\"1\",\"120,000 K\"
+";
+
+    fn snapshot(rows: &[u32]) -> HashSet<u32> {
+        rows.iter().copied().collect()
+    }
+
+    /// B9：同一 PID 但映像名是 `chrome.exe`（PID 被复用）不算存活。
+    #[test]
+    fn alive_pids_reject_reused_pid_with_foreign_image_name() {
+        let rows = parse_tasklist_csv(SNAPSHOT_CSV);
+        let alive = alive_snapshot_pids(&rows, &snapshot(&[4243]), |row| {
+            is_workbuddy_image_name(&row.name, WbVariant::Cn)
+        });
+        assert_eq!(alive, Vec::<u32>::new(), "PID 复用后不能判 WorkBuddy 还活着");
+    }
+
+    /// 快照外的 WorkBuddy 进程（表里有、但不在本次快照里）不得计入。
+    #[test]
+    fn alive_pids_ignore_workbuddy_rows_outside_the_snapshot() {
+        let rows = parse_tasklist_csv(SNAPSHOT_CSV);
+        let alive = alive_snapshot_pids(&rows, &snapshot(&[4242, 4243]), |row| {
+            is_workbuddy_image_name(&row.name, WbVariant::Cn)
+        });
+        assert_eq!(alive, vec![4242], "9999 不在快照里，不得报存活");
+    }
+
+    /// B7：快照为空时不发任何查询，立即返回空结论。
+    #[test]
+    fn wait_pids_gone_skips_query_when_snapshot_is_empty() {
+        let calls = std::cell::Cell::new(0);
+        let outcome = wait_pids_gone(&[], Duration::from_secs(5), &|| {
+            calls.set(calls.get() + 1);
+            Ok(Vec::new())
+        });
+        assert_eq!(outcome, WaitOutcome::default());
+        assert_eq!(calls.get(), 0, "空快照不得触发 tasklist 查询");
+    }
+
+    /// 一轮只发一次查询：超时为 0 时首轮观测到存活即返回。
+    #[test]
+    fn wait_pids_gone_queries_once_per_round() {
+        let calls = std::cell::Cell::new(0);
+        let outcome = wait_pids_gone(&[4242], Duration::ZERO, &|| {
+            calls.set(calls.get() + 1);
+            Ok(vec![4242])
+        });
+        assert_eq!(calls.get(), 1, "一轮只能发一次全表查询");
+        assert_eq!(outcome.alive, vec![4242]);
+        assert!(outcome.unobservable.is_empty());
+    }
+
+    /// A8/B8：查询连续两次失败 → 计入 unobservable、不当存活、文案含「无法确认」。
+    #[test]
+    fn wait_pids_gone_reports_unobservable_after_two_failures() {
+        let calls = std::cell::Cell::new(0);
+        let outcome = wait_pids_gone(&[4242, 4243], Duration::from_secs(5), &|| {
+            calls.set(calls.get() + 1);
+            Err("tasklist 查询超时或无法启动".to_string())
+        });
+        assert_eq!(calls.get(), 2, "失败必须重试一次");
+        assert_eq!(outcome, WaitOutcome {
+            alive: Vec::new(),
+            unobservable: vec![4242, 4243],
+        });
+
+        let message = close_failure_message(&outcome, &[]);
+        assert!(message.contains("无法确认进程状态"), "{message}");
+        assert!(!message.contains("顽固"), "查不清不得判顽固：{message}");
+        assert!(!message.contains("权限"), "查不清不是权限问题：{message}");
+    }
+
+    /// 首次失败后重试成功 → 按期返回存活，不误报 unobservable。
+    #[test]
+    fn wait_pids_gone_recovers_after_one_failed_query() {
+        let calls = std::cell::Cell::new(0);
+        let outcome = wait_pids_gone(&[4242], Duration::ZERO, &|| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 {
+                return Err("tasklist 查询超时或无法启动".to_string());
+            }
+            Ok(vec![4242])
+        });
+        assert_eq!(calls.get(), 2);
+        assert_eq!(outcome.alive, vec![4242]);
+        assert!(outcome.unobservable.is_empty());
+    }
+
+    fn kill_failure(pid: u32, exit_code: i32, stderr: &str) -> KillFailure {
+        KillFailure {
+            pid,
+            exit_code: Some(exit_code),
+            stderr_tail: stderr.to_string(),
+        }
+    }
+
+    /// B10：taskkill 退出码非 0 且 stderr 含「拒绝访问」→ 文案含「权限」，且不判顽固。
+    #[test]
+    fn close_failure_message_names_permission_when_taskkill_is_denied() {
+        let outcome = WaitOutcome {
+            alive: vec![4242],
+            unobservable: Vec::new(),
+        };
+        let failures = vec![kill_failure(4242, 1, "错误: 拒绝访问。")];
+        let message = close_failure_message(&outcome, &failures);
+        assert!(message.contains("权限"), "{message}");
+        assert!(message.contains("4242"), "{message}");
+        assert!(message.contains("拒绝访问"), "stderr 尾巴必须保留：{message}");
+    }
+
+    /// 英文 Windows 的「Access is denied」同样归为权限问题。
+    #[test]
+    fn close_failure_message_names_permission_for_english_stderr() {
+        let outcome = WaitOutcome {
+            alive: vec![4242],
+            unobservable: Vec::new(),
+        };
+        let failures = vec![kill_failure(4242, 128, "ERROR: Access is denied.")];
+        assert!(close_failure_message(&outcome, &failures).contains("权限"));
+    }
+
+    /// 退出码 0 但 PID 仍在 → 措辞是「顽固」，不得误称权限问题。
+    #[test]
+    fn close_failure_message_calls_stubborn_process_stubborn() {
+        let outcome = WaitOutcome {
+            alive: vec![4242],
+            unobservable: Vec::new(),
+        };
+        let message = close_failure_message(&outcome, &[]);
+        assert!(message.contains("顽固"), "{message}");
+        assert!(!message.contains("权限"), "没有权限证据不得提权限：{message}");
     }
 }

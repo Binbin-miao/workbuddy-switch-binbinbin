@@ -1092,6 +1092,7 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
   );
 
   // 镜像切换独立为第 4 个 tab（排在「附加同步」右侧，用户明确要求）。
+  const mirrorUnmerged = mirrorPreview?.unmerged ?? [];
   const mirrorTabContent = (
     <div className="space-y-2">
       {/* 镜像切换：显式独立通道。默认全关，绝不并入一键全选 / 工作记忆 / 人设 / 归档。 */}
@@ -1195,6 +1196,29 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
                   </li>
                 ))}
               </ul>
+            )}
+            {/* 组层面的合并缺口：只读观测，有才显示；不参与任何提交判据。 */}
+            {mirrorUnmerged.length > 0 && (
+              <details className="rounded-md border border-dashed px-2.5 py-2">
+                <summary className="cursor-pointer text-xs font-medium">
+                  {`本次将合并的对话（${mirrorUnmerged.length}）`}
+                </summary>
+                <ul className="mt-1.5 max-h-40 space-y-1 overflow-y-auto text-xs">
+                  {mirrorUnmerged.map((item) => (
+                    <li
+                      key={`mirror-unmerged:${item.groupId}:${item.motherSessionId}`}
+                      className="flex items-start justify-between gap-2"
+                    >
+                      <span className="min-w-0 break-all">
+                        {item.title || item.motherSessionId}
+                      </span>
+                      <span className="shrink-0 text-muted-foreground tabular-nums">
+                        {item.groupId ? `组 ${item.groupId.slice(0, 8)}` : "未建组"}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              </details>
             )}
             {/* 专家团清单：与 MEMORY.md 同形的第三步。跳过不是错误，因此只显示原因、不禁用执行。 */}
             {mirrorPreview.expertsPending && (

@@ -330,6 +330,19 @@ export interface MirrorTarget {
   kind: "session";
 }
 
+/**
+ * 组层面的合并缺口（只读观测）：母本在该组有存活成员，而目标账号在该组没有任何 Active 成员。
+ * 仅用于界面折叠展示，不参与 `expectedDigest` 与任何提交判据。
+ */
+export interface MirrorUnmergedItem {
+  groupId: string;
+  /** 母本会话行的展示标题；母本行不可读时为 null。 */
+  title: string | null;
+  motherSessionId: string;
+  /** 该组里缺 Active 成员的账号（当前恒为单个目标 uid）。 */
+  missingUids: string[];
+}
+
 /** 独立只读预览结果：凭证绑定 motherUid（当前登录账号），变化一律 REASON_PREVIEW_STALE。 */
 export interface MirrorPreview {
   motherUid: string;
@@ -351,6 +364,8 @@ export interface MirrorPreview {
   expertsNote: string | null;
   /** 执行前预登记的备份目录（预览阶段为 null）。 */
   backupDir: string | null;
+  /** 组层面的合并缺口；旧后端不返回该字段，缺省按空清单处理。 */
+  unmerged?: MirrorUnmergedItem[];
 }
 
 /**
@@ -386,6 +401,8 @@ export interface MirrorReport {
   warnings: string[];
   skipped: { sessionId: string; reason: string }[];
   errors: { sessionId: string; error: string }[];
+  /** 本次执行后仍缺的组层面合并缺口；还原/删除同步恒为空，旧后端不返回该字段。 */
+  unmerged?: MirrorUnmergedItem[];
 }
 
 /** 已同步的关联组（保留目标 sessionId 与标题）。 */
@@ -1025,8 +1042,10 @@ export interface TokenStatsTotals { total: number; input: number; output: number
 export interface TokenStatsGroup extends TokenStatsTotals { key: string; title?: string | null; project?: string; sessionId?: string; }
 /** 一次模型调用的明细行；`total = input + output + cacheWrite`，`uncachedInput = max(0, input - cacheRead)`，`thinking` 是 `output` 中思考过程的 token 数（回复内容 = max(0, output - thinking)），均与聚合口径一致。 */
 export interface TokenStatsRequestRow { timestamp: number; model: string; project: string; sessionId: string; title?: string | null; input: number; output: number; cacheRead: number; cacheWrite: number; uncachedInput: number; thinking: number; total: number; }
-/** `workbuddy-ai` 为国际版本地数据源，与国内版分开统计，数据源缺失时为空集。 */
-export interface TokenStatsSource { source: "workbuddy" | "workbuddy-ai" | "codebuddy-cli" | "codebuddy-ide"; summary: TokenStatsTotals; models: TokenStatsGroup[]; projects: TokenStatsGroup[]; sessions: TokenStatsGroup[]; daily: TokenStatsGroup[]; /** Optional model-specific daily series for trend filtering. */ dailyByModel?: Record<string, TokenStatsGroup[]>; /** 仅 CodeBuddy CLI 来源返回的最近请求明细；旧后端或缺失时按空数组处理。 */ requests?: TokenStatsRequestRow[]; hours: TokenStatsGroup[]; filesScanned: number; parseErrors: number; coverageStartAt?: number | null; coverageEndAt?: number | null; }
+/** 数据源可用性三态：没装 / 装了没数据 / 有数据。 */
+export type TokenStatsAvailability = "ready" | "no-data" | "not-installed";
+/** `workbuddy-ai` 为国际版本地数据源，与国内版分开统计，数据源缺失时为空集；`codebuddy-jetbrains` 为 JetBrains 插件会话。 */
+export interface TokenStatsSource { source: "workbuddy" | "workbuddy-ai" | "codebuddy-cli" | "codebuddy-ide" | "codebuddy-jetbrains"; availability: TokenStatsAvailability; summary: TokenStatsTotals; models: TokenStatsGroup[]; projects: TokenStatsGroup[]; sessions: TokenStatsGroup[]; daily: TokenStatsGroup[]; /** Optional model-specific daily series for trend filtering. */ dailyByModel?: Record<string, TokenStatsGroup[]>; /** 仅 CodeBuddy CLI 来源返回的最近请求明细；旧后端或缺失时按空数组处理。 */ requests?: TokenStatsRequestRow[]; hours: TokenStatsGroup[]; filesScanned: number; parseErrors: number; coverageStartAt?: number | null; coverageEndAt?: number | null; }
 export interface TokenStatistics { generatedAt: number; rangeDays?: number | null; sources: TokenStatsSource[]; }
 
 export interface CodeBuddyCliStatus {

@@ -604,6 +604,7 @@ function demoTokenSource(source: TokenStatsSource["source"], scale: number): Tok
   const now = Date.now();
   return {
     source, summary, models, projects, sessions, daily, hours,
+    availability: "ready",
     filesScanned: source === "workbuddy" ? 63 : source === "codebuddy-ide" ? 17 : 41,
     parseErrors: 0,
     coverageStartAt: now - 13 * 86_400_000,
@@ -614,9 +615,13 @@ function demoTokenSource(source: TokenStatsSource["source"], scale: number): Tok
 }
 
 /** 国际版数据源：演示环境不构造数据，保持真实的「空集」形态（页面显示空状态）。 */
-function emptyTokenSource(source: TokenStatsSource["source"]): TokenStatsSource {
+function emptyTokenSource(
+  source: TokenStatsSource["source"],
+  availability: TokenStatsSource["availability"],
+): TokenStatsSource {
   return {
     source,
+    availability,
     summary: demoTokenTotals(0, 0, 0, 0, 0),
     models: [],
     projects: [],
@@ -629,7 +634,19 @@ function emptyTokenSource(source: TokenStatsSource["source"]): TokenStatsSource 
 }
 
 function demoTokenStatistics(days?: number): TokenStatistics {
-  return { generatedAt: Date.now(), rangeDays: days ?? null, sources: [demoTokenSource("workbuddy", 1), emptyTokenSource("workbuddy-ai"), demoTokenSource("codebuddy-cli", 0.58), demoTokenSource("codebuddy-ide", 0.36)] };
+  return {
+    generatedAt: Date.now(),
+    rangeDays: days ?? null,
+    sources: [
+      demoTokenSource("workbuddy", 1),
+      // 国际版：装了没数据。
+      emptyTokenSource("workbuddy-ai", "no-data"),
+      demoTokenSource("codebuddy-cli", 0.58),
+      demoTokenSource("codebuddy-ide", 0.36),
+      // JetBrains 插件：演示三态里的「没装」。
+      emptyTokenSource("codebuddy-jetbrains", "not-installed"),
+    ],
+  };
 }
 
 /** 演示用的 IDE 会话列表：国内版 / 国际版共用同一套存储，只有来源 uid 不同。 */
