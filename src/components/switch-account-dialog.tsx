@@ -563,6 +563,38 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
             ? `镜像部分完成：已软删 ${mirrorReport.deletedSessions} 个、复制 ${mirrorReport.copiedSessions} 个`
             : `整份镜像完成：软删 ${mirrorReport.deletedSessions} 个会话、复制 ${mirrorReport.copiedSessions} 个会话`;
         parts.push(title);
+        // 自动同步落后副本：只在真的同步过时才加一行；失败的组必须让人看得见，
+        // 不能静默（`syncedSessions` 恒有值，不能拿它判「老后端」）。
+        const syncedCount = mirrorReport.syncedSessions ?? 0;
+        const overwrittenCount = mirrorReport.overwrittenSessions ?? 0;
+        const syncFailedCount = mirrorReport.syncErrors?.length ?? 0;
+        if (syncedCount > 0) {
+          parts.push(
+            overwrittenCount > 0
+              ? `已同步 ${syncedCount} 个组（覆盖 ${overwrittenCount} 个）`
+              : `已同步 ${syncedCount} 个组`,
+          );
+        }
+        if (syncFailedCount > 0) {
+          parts.push(`${syncFailedCount} 个组同步失败，详见切号报告`);
+        }
+        const overwrittenGroups = (mirrorReport.syncDetails ?? []).filter(
+          (item) => item.overwritten,
+        );
+        if (overwrittenGroups.length > 0) {
+          toast.warning(`已用母本覆盖 ${overwrittenGroups.length} 个组的副本`, {
+            description: `这些组在目标账号里有自己的内容，已整份换成母本的（每组都已先备份）：${overwrittenGroups
+              .map((item) => item.title ?? item.groupId)
+              .join("；")}`,
+          });
+        }
+        if (syncFailedCount > 0) {
+          toast.warning(`${syncFailedCount} 个组未同步成与母本一致`, {
+            description: (mirrorReport.syncErrors ?? [])
+              .map((item) => `${item.title ?? item.groupId}：${item.error}`)
+              .join("；"),
+          });
+        }
         if (backup) {
           rememberMirrorBackup(backup);
           setMirrorBackup(backup);

@@ -10,7 +10,7 @@
 //! - 目标清单只从 `user_id = 目标 uid` 且 `deleted_at IS NULL` 的行生成（含未建组的私有
 //!   会话，逐条不折叠）；身份按 `LinkMember.uid` 精确匹配，绝不按标题全局去重（11-06 误删教训）。
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use rusqlite::{params, Connection, OptionalExtension};
@@ -22,12 +22,13 @@ use crate::modules::config::{atomic_write, now_ms, wb_data_root};
 use crate::modules::experts;
 use crate::modules::memory;
 use crate::modules::session::{
-    self, current_user_uid_at, open_db, table_exists, SessionPaths, REASON_PREVIEW_STALE,
+    self, current_user_uid_at, open_db, table_exists, SessionPaths, SyncSelection,
+    REASON_PREVIEW_STALE,
 };
 use crate::modules::session_backup;
 use crate::modules::session_link::{
     self, full_digest_of, LinkGroup, MemberState, PreviewBinding, PreviewMemberBinding, PreviewToken,
-    SyncVerdict,
+    SyncMode, SyncVerdict,
 };
 use crate::modules::variant::WbVariant;
 
@@ -114,6 +115,35 @@ pub struct MirrorError {
     pub error: String,
 }
 
+/// 自动同步成功的一个关联组：「母本领先、目标落后」的副本已补齐。
+///
+/// `mode` 只可能是 `fastForward`（目标为母本严格有序前缀，零内容损失）或
+/// `overwrite`（分叉，按 P1 用母本整份覆盖，目标独有内容丢失）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MirrorSyncedGroup {
+    pub group_id: String,
+    /// 组展示名（取母本会话标题）；读不到时为 `None`。
+    pub title: Option<String>,
+    pub mode: String,
+    /// 是否以母本覆盖了目标（P1 的透明度代价：界面据此逐条列出被覆盖组）。
+    pub overwritten: bool,
+    /// 覆盖前目标正文的记录数。
+    pub target_records_before: usize,
+    /// 本次追加（快进）或覆盖后相比覆盖前新增的记录数。
+    pub added_records: usize,
+}
+
+/// 自动同步失败的一个关联组：不阻断切号，只逐条上报。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MirrorSyncError {
+    /// 失败的组；整体失败（预览/加锁不可用）时为空串。
+    pub group_id: String,
+    pub title: Option<String>,
+    pub error: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MirrorReport {
@@ -137,6 +167,18 @@ pub struct MirrorReport {
     /// 还原与删除同步没有该语义，恒为空清单；`#[serde(default)]` 兼容老载荷与老前端。
     #[serde(default)]
     pub unmerged: Vec<MirrorUnmerged>,
+    /// 本次自动同步成与母本一致的组数（B1/B2 交给复制，不计入这里）。
+    #[serde(default)]
+    pub synced_sessions: usize,
+    /// 其中按 P1 用母本整份覆盖目标（diverge）的组数。
+    #[serde(default)]
+    pub overwritten_sessions: usize,
+    /// 逐组同步明细，供界面列出被覆盖的组名。
+    #[serde(default)]
+    pub sync_details: Vec<MirrorSyncedGroup>,
+    /// 逐组同步失败；失败不阻断切号，与复制侧 `errors` 互不污染。
+    #[serde(default)]
+    pub sync_errors: Vec<MirrorSyncError>,
 }
 
 /// 组层面的合并缺口（只读观测）：母本在该组有存活 `Active` 成员，而目标账号在该组
@@ -400,6 +442,9 @@ pub struct MirrorRow {
     pub title: Option<String>,
     pub custom_title: Option<String>,
     pub updated_at: i64,
+    /// 最近活跃时刻：`COALESCE(last_activity_at, updated_at)`，缺列时退回 `updated_at`。
+    /// 只给「落后副本预筛」用，**绝不进** [`session_row_digest`]（否则凭据会因时间戳变化失配）。
+    pub activity_at: i64,
     /// Some = 已软删，绝不进清单；None = deleted_at IS NULL。
     pub deleted_at: Option<i64>,
 }
@@ -695,8 +740,9 @@ fn read_target_rows(conn: &Connection, target_uid: &str) -> Result<Vec<MirrorRow
         ""
     };
     let sql = format!(
-        "SELECT id, user_id, title, {custom_expr}, updated_at FROM sessions \
-         WHERE user_id = ?1{deleted_filter} ORDER BY id"
+        "SELECT id, user_id, title, {custom_expr}, updated_at, {} FROM sessions \
+         WHERE user_id = ?1{deleted_filter} ORDER BY id",
+        activity_expr(conn)
     );
     let mut stmt = conn
         .prepare(&sql)
@@ -709,6 +755,7 @@ fn read_target_rows(conn: &Connection, target_uid: &str) -> Result<Vec<MirrorRow
                 title: row.get::<_, Option<String>>(2)?,
                 custom_title: row.get::<_, Option<String>>(3)?,
                 updated_at: row.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                activity_at: row.get::<_, Option<i64>>(5)?.unwrap_or(0),
                 deleted_at: None, // SQL 已过滤为 IS NULL
             })
         })
@@ -718,6 +765,18 @@ fn read_target_rows(conn: &Connection, target_uid: &str) -> Result<Vec<MirrorRow
         rows.push(row.map_err(|error| format!("镜像预览：会话行读取失败：{error}"))?);
     }
     Ok(rows)
+}
+
+/// 最近活跃时刻的 SQL 表达式：`last_activity_at` 列存在时取 `COALESCE(它, updated_at)`。
+///
+/// 老库没有该列（`session.rs` 用 `ALTER TABLE` 追加），缺列时退回 `updated_at`，与列表
+/// 排序键 `COALESCE(last_activity_at, created_at)` 同源同口径。
+fn activity_expr(conn: &Connection) -> &'static str {
+    if column_exists(conn, "sessions", "last_activity_at") {
+        "COALESCE(last_activity_at, updated_at)"
+    } else {
+        "updated_at"
+    }
 }
 
 /// 只读采样某账号**全部**会话行的存活状态，**不过滤** `deleted_at`。
@@ -1245,6 +1304,7 @@ pub fn mirror_apply_at(
     variant: WbVariant,
     target_uid: &str,
     acc: &Value,
+    mother_acc: &Value,
     memory_root: &Path,
     plan: &MirrorPlan,
 ) -> Result<MirrorReport, String> {
@@ -1275,11 +1335,19 @@ pub fn mirror_apply_at(
     let target_alive_ids = alive_ids_of(&rows);
     let live_targets = mirror_targets_from_rows(&rows, target_uid, &mother_uid, &groups, &mother_states);
     let live_expected_digest = expected_digest_of(&live_targets);
-    // 母本行标题只采样一次：零操作分支与正式返回都要用它算「仍缺清单」，不重复读库。
-    let mother_titles: HashMap<String, String> = read_target_rows(&conn, &mother_uid)?
-        .into_iter()
-        .map(|row| (row.session_id, display_title(row.title, row.custom_title)))
+    // 母本行只读一次：标题（「仍缺清单」用）与活跃时刻（落后副本预筛用）同源，零新增查询。
+    let mother_rows = read_target_rows(&conn, &mother_uid)?;
+    let mother_titles: HashMap<String, String> = mother_rows
+        .iter()
+        .map(|row| {
+            (
+                row.session_id.clone(),
+                display_title(row.title.clone(), row.custom_title.clone()),
+            )
+        })
         .collect();
+    let mother_activity = activity_by_session(&mother_rows);
+    let target_activity = activity_by_session(&rows);
 
     // 硬门禁 2：expectedDigest 逐条重算，与计划不符 → 零写入。
     if live_expected_digest != plan.expected_digest {
@@ -1338,6 +1406,17 @@ pub fn mirror_apply_at(
         &target_alive_ids,
     );
 
+    // 预筛（纯函数、零 IO）：母本领先而目标落后的组才是自动同步候选。全库全组算内容摘要
+    // 不可接受（几百组 × 两份正文），这一步把内容预览的范围压到真正活跃且落后的组。
+    let (behind, target_ahead) = classify_activity_shift(
+        &groups,
+        &mother_activity,
+        &target_activity,
+        &mother_uid,
+        target_uid,
+        MIRROR_SYNC_MARGIN_MS,
+    );
+
     // 记忆是否已一致：必须并入「零操作」判定——否则「仅 MEMORY.md 不同」的切号会被整体跳过，
     // 镜像就不算 100%。
     let memory_pending = !memory::memory_already_identical(memory_root, &mother_uid, target_uid);
@@ -1355,8 +1434,14 @@ pub fn mirror_apply_at(
         Err(block) => Some(expert_step_error(block.message())),
     };
 
-    // 既无待删、也无待复制、记忆与专家团都已一致：无操作、不建备份目录（避免空还原项）。
-    if live_targets.is_empty() && missing.is_empty() && !memory_pending && !experts_pending {
+    // 既无待删、也无待复制、也没有落后的副本、记忆与专家团都已一致：无操作、不建备份目录
+    // （避免空还原项）。
+    if live_targets.is_empty()
+        && missing.is_empty()
+        && behind.is_empty()
+        && !memory_pending
+        && !experts_pending
+    {
         return Ok(MirrorReport {
             deleted_sessions: 0,
             copied_sessions: 0,
@@ -1370,6 +1455,10 @@ pub fn mirror_apply_at(
             errors: experts_plan_error.into_iter().collect(),
             // 零操作：什么都没改，当前缺口就是执行后的缺口。
             unmerged: unmerged_groups(&groups, &mother_uid, target_uid, &mother_states, &mother_titles),
+            synced_sessions: 0,
+            overwritten_sessions: 0,
+            sync_details: Vec::new(),
+            sync_errors: Vec::new(),
         });
     }
 
@@ -1411,6 +1500,38 @@ pub fn mirror_apply_at(
         copy_missing_sessions(paths, variant, acc, target_uid, &missing)
     };
 
+    // 自动同步「母本领先、目标落后」的副本：必须在复制之后——复制会给缺失组新增目标
+    // `Active` 成员、改变内容绑定，先取预览凭据必然 STALE。整段软失败（错误进
+    // `sync_errors`），绝不阻断切号；认证尚未写入，登录态仍是母本。
+    let sync_outcome = if behind.is_empty() {
+        MirrorSyncOutcome::default()
+    } else if account_uid_of(mother_acc) != mother_uid {
+        // 母本凭据不可用就无从确定同步作用域：整段跳过并如实上报，不改走 Err（§8.4）。
+        MirrorSyncOutcome::whole_failure(
+            &behind,
+            "母本账号凭据不可用，本次未自动同步落后副本".to_string(),
+        )
+    } else {
+        sync_behind_copies(
+            &behind,
+            || {
+                session::session_links_preview_cross_for_groups_at(
+                    paths, variant, mother_acc, acc, &behind,
+                )
+            },
+            |selections| {
+                session::sync_sessions_cross_same_variant_at(
+                    paths,
+                    variant,
+                    mother_acc,
+                    acc,
+                    selections,
+                    |_| false,
+                )
+            },
+        )
+    };
+
     // MEMORY.md 整份覆盖（只写目标账号）：失败不阻断已完成的软删/复制；
     // 记忆备份路径登记进同一清单，作为与 sessions 解耦的独立可还原步骤。
     let (memory_backup, memory_errors) = if memory_pending {
@@ -1432,6 +1553,17 @@ pub fn mirror_apply_at(
 
     // 软删+复制+记忆覆盖+专家团覆盖完成后把清单原子改写为 done；失败仅降级为 warning。
     let mut warnings = Vec::new();
+    // B6：目标更新的组一律不回退（母本是唯一内容权威），但必须让人知道有这回事。
+    if !target_ahead.is_empty() {
+        warnings.push(format!(
+            "{} 个组的母本内容比目标旧，本次未回退（镜像只补齐母本领先的副本）",
+            target_ahead.len()
+        ));
+    }
+    // B9-bis：预筛命中却没有任何一组真的写入（内容实为一致）——备份已建、却无条目。
+    if !behind.is_empty() && sync_outcome.details.is_empty() && sync_outcome.errors.is_empty() {
+        warnings.push(format!("预筛 {} 个组，核对后实际无需同步", behind.len()));
+    }
     match space_repair {
         Ok(0) => {}
         Ok(fixed) => warnings.push(format!(
@@ -1478,6 +1610,10 @@ pub fn mirror_apply_at(
         skipped,
         errors,
         unmerged,
+        synced_sessions: sync_outcome.synced,
+        overwritten_sessions: sync_outcome.overwritten,
+        sync_details: sync_outcome.details,
+        sync_errors: sync_outcome.errors,
     })
 }
 
@@ -1555,6 +1691,300 @@ fn copy_missing_sessions(
         .and_then(Value::as_bool)
         .unwrap_or(false);
     (copied_entries, copy_errors, copy_needs_recovery)
+}
+
+// ---------------------------------------------------------------------------
+// 自动同步落后副本：预筛（纯函数）+ 模式映射（纯查表）+ 逐组同步
+// ---------------------------------------------------------------------------
+
+/// 预筛阈值：母本活跃时刻超出目标这么多，才算「母本领先、目标落后」。
+///
+/// 一轮真实对话必然把 `last_activity_at` 推到秒级新值；60s 只为吃掉「同一次写入被两条
+/// 记录分摊 / 两个账号行落在同一事务里」造成的时间戳抖动。取 0 会让刚复制出来的新副本
+/// 反复进候选，取太大（如 1 天）又会漏掉当天仍在活跃的组。
+pub const MIRROR_SYNC_MARGIN_MS: i64 = 60_000;
+
+/// 镜像自动选择的写入模式（纯查表）。
+///
+/// 只放行两种真的能写、且 `available_modes()` 也放行的判定：`fastForward` 与 `diverge`。
+/// `identical` 无需写入；`ahead`（母本落后于目标）虽然在 `allows()` 里对
+/// `UnifyOverwrite` 放行，但该模式不在 `available_modes()` —— 它是组级「整组保留来源副本」
+/// 的专用动作，镜像层**禁止**自造它去绕过该限制；`unknown` 不可验证，覆盖不能绕过未知。
+pub fn auto_sync_mode(verdict: SyncVerdict) -> Option<SyncMode> {
+    match verdict {
+        SyncVerdict::FastForward => Some(SyncMode::FastForward),
+        SyncVerdict::Diverge => Some(SyncMode::Overwrite),
+        SyncVerdict::Identical | SyncVerdict::Ahead | SyncVerdict::Unknown => None,
+    }
+}
+
+/// 母本领先的候选组（纯函数，零 IO，返回按 `group_id` 升序去重）。
+///
+/// 判据（逐组，顶部扁平卫语句）：
+/// 1. 组内没有母本 `Active` 成员 → 无从比较，跳过；
+/// 2. 组内没有目标 `Active` 成员 → 目标无副本/副本已失效，交给复制路径（B1/B2）；
+/// 3. `mother_max <= target_max + margin_ms` → 内容一致或目标更新（B3/B6），不碰。
+pub fn groups_behind_candidates(
+    groups: &[LinkGroup],
+    mother_activity: &HashMap<String, i64>,
+    target_activity: &HashMap<String, i64>,
+    mother_uid: &str,
+    target_uid: &str,
+    margin_ms: i64,
+) -> Vec<String> {
+    classify_activity_shift(
+        groups,
+        mother_activity,
+        target_activity,
+        mother_uid,
+        target_uid,
+        margin_ms,
+    )
+    .0
+}
+
+/// 一次时间戳扫描的两份产出：`(母本领先的组, 目标更新且不回退的组)`。
+///
+/// 两者共用同一份 `sessions` 行快照与同一组判据，分开各扫一遍只是重复读取。
+fn classify_activity_shift(
+    groups: &[LinkGroup],
+    mother_activity: &HashMap<String, i64>,
+    target_activity: &HashMap<String, i64>,
+    mother_uid: &str,
+    target_uid: &str,
+    margin_ms: i64,
+) -> (Vec<String>, Vec<String>) {
+    let mut behind: BTreeSet<String> = BTreeSet::new();
+    let mut target_ahead: Vec<String> = Vec::new();
+    for group in groups {
+        let Some(mother_max) = active_activity_of(group, mother_uid, mother_activity) else {
+            continue;
+        };
+        let Some(target_max) = active_activity_of(group, target_uid, target_activity) else {
+            continue;
+        };
+        if mother_max > target_max + margin_ms {
+            behind.insert(group.id.clone());
+        } else if target_max > mother_max + margin_ms {
+            target_ahead.push(group.id.clone());
+        }
+    }
+    (behind.into_iter().collect(), target_ahead)
+}
+
+/// 组内某账号 `Active` 成员的最大活跃时刻；没有 `Active` 成员时返回 `None`。
+///
+/// 缺值（历史脏数据没有活动时间）按 0 处理：宁可多算一次内容预览，也不会写错。
+fn active_activity_of(
+    group: &LinkGroup,
+    uid: &str,
+    activity: &HashMap<String, i64>,
+) -> Option<i64> {
+    group
+        .members
+        .iter()
+        .filter(|member| member.uid == uid && member.state == MemberState::Active)
+        .map(|member| activity.get(&member.session_id).copied().unwrap_or(0))
+        .max()
+}
+
+/// 只读行 → `session_id -> activity_at`（预筛输入；零新增查询）。
+fn activity_by_session(rows: &[MirrorRow]) -> HashMap<String, i64> {
+    rows.iter()
+        .filter(|row| !row.session_id.is_empty())
+        .map(|row| (row.session_id.clone(), row.activity_at))
+        .collect()
+}
+
+/// 自动同步的产出：三个计数 + 明细，整份并进 [`MirrorReport`]。
+#[derive(Debug, Default)]
+struct MirrorSyncOutcome {
+    synced: usize,
+    overwritten: usize,
+    details: Vec<MirrorSyncedGroup>,
+    errors: Vec<MirrorSyncError>,
+}
+
+impl MirrorSyncOutcome {
+    /// 整体失败（母本凭据不可用 / 预览读不到）：一组一条，其余组不牵连。
+    fn whole_failure(group_ids: &[String], error: String) -> Self {
+        Self {
+            errors: group_ids
+                .iter()
+                .map(|group_id| MirrorSyncError {
+                    group_id: group_id.clone(),
+                    title: None,
+                    error: error.clone(),
+                })
+                .collect(),
+            ..Self::default()
+        }
+    }
+}
+
+/// 预览 JSON 的 `verdict` 取值 → 枚举；未知取值一律按 `Unknown`（覆盖不能绕过未知）。
+fn verdict_of(raw: &str) -> SyncVerdict {
+    match raw {
+        "identical" => SyncVerdict::Identical,
+        "fastForward" => SyncVerdict::FastForward,
+        "ahead" => SyncVerdict::Ahead,
+        "diverge" => SyncVerdict::Diverge,
+        _ => SyncVerdict::Unknown,
+    }
+}
+
+/// 把「母本领先的候选组」同步成与母本一致；失败逐组进 `sync_errors`，绝不阻断切号。
+///
+/// 预览与同步都以闭包注入：预览走 `session_links_preview_cross_for_groups_at`、写入走
+/// `sync_sessions_cross`，两者内部各自持档位操作锁并复核凭据，镜像层不重复加锁、
+/// 也不跳过 `verdict.allows(mode)` 的复核。
+fn sync_behind_copies(
+    candidate_group_ids: &[String],
+    preview: impl FnOnce() -> Result<Value, String>,
+    sync: impl FnOnce(&[SyncSelection]) -> Result<Value, String>,
+) -> MirrorSyncOutcome {
+    if candidate_group_ids.is_empty() {
+        return MirrorSyncOutcome::default();
+    }
+    let preview = match preview() {
+        Ok(value) => value,
+        // B8：预览整体读不到 → 一组一条，绝不构造 SyncSelection。
+        Err(error) => {
+            return MirrorSyncOutcome::whole_failure(
+                candidate_group_ids,
+                format!("预览落后副本失败：{error}"),
+            )
+        }
+    };
+    let items = preview
+        .get("groups")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut outcome = MirrorSyncOutcome::default();
+    let mut titles: HashMap<String, Option<String>> = HashMap::new();
+    let mut selections: Vec<SyncSelection> = Vec::new();
+    for item in &items {
+        let Some(group_id) = item.get("groupId").and_then(Value::as_str) else {
+            continue;
+        };
+        let title = item
+            .get("title")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        titles.insert(group_id.to_string(), title.clone());
+        let verdict = verdict_of(item.get("verdict").and_then(Value::as_str).unwrap_or_default());
+        let Some(mode) = auto_sync_mode(verdict) else {
+            // B7：不可验证的组必须让人看见；identical / ahead 无需写入，静默跳过。
+            if verdict == SyncVerdict::Unknown {
+                outcome.errors.push(MirrorSyncError {
+                    group_id: group_id.to_string(),
+                    title,
+                    error: "目标副本已失效，需手动处理".to_string(),
+                });
+            }
+            continue;
+        };
+        let Some(preview_token) = item.get("previewToken").and_then(Value::as_str) else {
+            // B8：没有凭据绝不构造 selection（缺 token 会让整次同步 Err）。
+            outcome.errors.push(MirrorSyncError {
+                group_id: group_id.to_string(),
+                title,
+                error: "预览凭据已失效，本次未同步该组".to_string(),
+            });
+            continue;
+        };
+        let offered = item
+            .get("availableModes")
+            .and_then(Value::as_array)
+            .is_some_and(|modes| modes.iter().any(|offered| offered.as_str() == Some(mode.as_str())));
+        if !offered {
+            outcome.errors.push(MirrorSyncError {
+                group_id: group_id.to_string(),
+                title,
+                error: "预览未授权写入模式，本次未同步该组".to_string(),
+            });
+            continue;
+        }
+        selections.push(SyncSelection {
+            group_id: group_id.to_string(),
+            preview_token: preview_token.to_string(),
+            mode,
+        });
+    }
+    if selections.is_empty() {
+        return outcome;
+    }
+    let group_ids: Vec<String> = selections
+        .iter()
+        .map(|selection| selection.group_id.clone())
+        .collect();
+    let report = match sync(&selections) {
+        Ok(report) => report,
+        // B9：写入整体失败（加锁/档位不支持/App 仍在运行）→ 一组一条，不重试。
+        Err(error) => return MirrorSyncOutcome::whole_failure(&group_ids, error),
+    };
+    for item in array_of(&report, "synced") {
+        let Some(group_id) = item.get("groupId").and_then(Value::as_str) else {
+            continue;
+        };
+        let mode = item
+            .get("mode")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let overwritten = mode == SyncMode::Overwrite.as_str();
+        let target_before = record_count_field(&item, "targetBefore");
+        let target_after = record_count_field(&item, "target");
+        outcome.details.push(MirrorSyncedGroup {
+            group_id: group_id.to_string(),
+            title: titles.get(group_id).cloned().flatten(),
+            mode,
+            overwritten,
+            target_records_before: target_before,
+            added_records: target_after.saturating_sub(target_before),
+        });
+    }
+    // 请求写入却被判定跳过（内容其实已一致等）：不计数，但要如实上报（B9-bis 的噪音）。
+    for key in ["skipped", "errors"] {
+        for item in array_of(&report, key) {
+            let group_id = item
+                .get("groupId")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let error = item
+                .get("error")
+                .or_else(|| item.get("message"))
+                .and_then(Value::as_str)
+                .unwrap_or("同步未完成")
+                .to_string();
+            outcome.errors.push(MirrorSyncError {
+                title: titles.get(&group_id).cloned().flatten(),
+                group_id,
+                error,
+            });
+        }
+    }
+    outcome.synced = outcome.details.len();
+    outcome.overwritten = outcome.details.iter().filter(|item| item.overwritten).count();
+    outcome
+}
+
+/// 同步报告里某个数组字段（`synced` / `skipped` / `errors`）；缺字段按空清单处理。
+fn array_of(report: &Value, key: &str) -> Vec<Value> {
+    report
+        .get(key)
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn record_count_field(item: &Value, key: &str) -> usize {
+    item.get("recordCount")
+        .and_then(|counts| counts.get(key))
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize
 }
 
 /// 整份覆盖目标账号 `MEMORY.md`：成功回填备份路径，失败折算成 `errors`（不阻断软删/复制）。
@@ -1792,6 +2222,11 @@ pub fn mirror_restore_at(
         errors,
         // 还原不是镜像合并，没有「仍缺清单」语义。
         unmerged: Vec::new(),
+        // 还原不跑落后副本同步，四个同步字段恒为「没有」。
+        synced_sessions: 0,
+        overwritten_sessions: 0,
+        sync_details: Vec::new(),
+        sync_errors: Vec::new(),
     })
 }
 
@@ -1927,8 +2362,9 @@ fn read_all_rows(conn: &Connection) -> Result<Vec<MirrorRow>, String> {
         "NULL"
     };
     let sql = format!(
-        "SELECT id, user_id, title, {custom_expr}, updated_at, {deleted_expr} \
-         FROM sessions ORDER BY id"
+        "SELECT id, user_id, title, {custom_expr}, updated_at, {deleted_expr}, {} \
+         FROM sessions ORDER BY id",
+        activity_expr(conn)
     );
     let mut stmt = conn
         .prepare(&sql)
@@ -1942,6 +2378,7 @@ fn read_all_rows(conn: &Connection) -> Result<Vec<MirrorRow>, String> {
                 custom_title: row.get::<_, Option<String>>(3)?,
                 updated_at: row.get::<_, Option<i64>>(4)?.unwrap_or(0),
                 deleted_at: row.get::<_, Option<i64>>(5)?,
+                activity_at: row.get::<_, Option<i64>>(6)?.unwrap_or(0),
             })
         })
         .map_err(|error| format!("删除同步：会话清单读取失败：{error}"))?;
@@ -2069,6 +2506,11 @@ pub fn deleted_sync_apply_at(
             errors: Vec::new(),
             // 删除同步不涉及母本合并，没有「仍缺清单」语义。
             unmerged: Vec::new(),
+            // 删除同步也不跑落后副本同步，四个同步字段恒为「没有」。
+            synced_sessions: 0,
+            overwritten_sessions: 0,
+            sync_details: Vec::new(),
+            sync_errors: Vec::new(),
         });
     }
 
@@ -2139,6 +2581,11 @@ pub fn deleted_sync_apply_at(
         errors: Vec::new(),
         // 删除同步不涉及母本合并，没有「仍缺清单」语义。
         unmerged: Vec::new(),
+        // 删除同步也不跑落后副本同步，四个同步字段恒为「没有」。
+        synced_sessions: 0,
+        overwritten_sessions: 0,
+        sync_details: Vec::new(),
+        sync_errors: Vec::new(),
     })
 }
 
@@ -2334,6 +2781,7 @@ mod tests {
                 title: Some("原名".to_string()),
                 custom_title: Some("改名".to_string()),
                 updated_at: 1000,
+                activity_at: 1000,
                 deleted_at: None,
             },
             MirrorRow {
@@ -2342,6 +2790,7 @@ mod tests {
                 title: Some("母本会话".to_string()),
                 custom_title: None,
                 updated_at: 1000,
+                activity_at: 1000,
                 deleted_at: None,
             },
             MirrorRow {
@@ -2350,6 +2799,7 @@ mod tests {
                 title: Some("第三方".to_string()),
                 custom_title: None,
                 updated_at: 1000,
+                activity_at: 1000,
                 deleted_at: None,
             },
             MirrorRow {
@@ -2358,6 +2808,7 @@ mod tests {
                 title: Some("已软删".to_string()),
                 custom_title: None,
                 updated_at: 1000,
+                activity_at: 1000,
                 deleted_at: Some(999),
             },
         ];
@@ -2387,6 +2838,7 @@ mod tests {
             title: None,
             custom_title: None,
             updated_at: 1,
+            activity_at: 1,
             deleted_at: None,
         }];
         let targets = mirror_targets_from_rows(&rows, "u-target", "u-mother", &[], &HashMap::new());
@@ -2412,6 +2864,11 @@ mod tests {
         states
     }
 
+    /// 测试用母本账号对象：uid 与各用例 seed 的登录态一致（`seed_auth(.., "u-mother")`）。
+    fn mother_acc() -> Value {
+        json!({"uid": "u-mother"})
+    }
+
     fn target_row(session_id: &str) -> MirrorRow {
         MirrorRow {
             session_id: session_id.to_string(),
@@ -2419,6 +2876,7 @@ mod tests {
             title: Some(format!("标题-{session_id}")),
             custom_title: None,
             updated_at: 1000,
+            activity_at: 1000,
             deleted_at: None,
         }
     }
@@ -3059,7 +3517,7 @@ mod tests {
         let plan = preview_plan(&paths, "u-target");
         assert_eq!(plan.targets.len(), 2, "只列 u-target 未软删两行");
 
-        let report = mirror_apply_at(&paths, WbVariant::Cn, "u-target", &json!({"uid": "u-target"}), &paths.data_root, &plan).unwrap();
+        let report = mirror_apply_at(&paths, WbVariant::Cn, "u-target", &json!({"uid": "u-target"}), &mother_acc(), &paths.data_root, &plan).unwrap();
         assert_eq!(report.deleted_sessions, 2);
         assert!(report.backup.is_some(), "软删必须留备份");
         assert!(deleted_at_of(&paths, "s-1").is_some());
@@ -3129,13 +3587,13 @@ mod tests {
         seed_session_db(&paths, &[("s-1", "u-target", 1000, None)]);
         seed_gone_mother_groups(&paths, &["s-1"]);
         let plan = preview_plan(&paths, "u-target");
-        let first = mirror_apply_at(&paths, WbVariant::Cn, "u-target", &json!({"uid": "u-target"}), &paths.data_root, &plan).unwrap();
+        let first = mirror_apply_at(&paths, WbVariant::Cn, "u-target", &json!({"uid": "u-target"}), &mother_acc(), &paths.data_root, &plan).unwrap();
         assert_eq!(first.deleted_sessions, 1);
         let written = deleted_at_of(&paths, "s-1").unwrap();
 
         // 同一份计划重放必须 fail-closed（集合已变），且不重复写入、不改写已置位行。
         assert!(
-            mirror_apply_at(&paths, WbVariant::Cn, "u-target", &json!({"uid": "u-target"}), &paths.data_root, &plan).is_err(),
+            mirror_apply_at(&paths, WbVariant::Cn, "u-target", &json!({"uid": "u-target"}), &mother_acc(), &paths.data_root, &plan).is_err(),
             "同一计划重放应被拒绝而非再次软删"
         );
         assert_eq!(deleted_at_of(&paths, "s-1"), Some(written), "重放不动已置位行");
@@ -3143,7 +3601,7 @@ mod tests {
         // 重新预览：目标已空 → 第二次 deleted=0，且不建空备份。
         let empty_plan = preview_plan(&paths, "u-target");
         assert!(empty_plan.targets.is_empty());
-        let second = mirror_apply_at(&paths, WbVariant::Cn, "u-target", &json!({"uid": "u-target"}), &paths.data_root, &empty_plan).unwrap();
+        let second = mirror_apply_at(&paths, WbVariant::Cn, "u-target", &json!({"uid": "u-target"}), &mother_acc(), &paths.data_root, &empty_plan).unwrap();
         assert_eq!(second.deleted_sessions, 0);
         assert!(second.backup.is_none(), "空清单不建备份目录");
     }
@@ -3157,7 +3615,7 @@ mod tests {
         let mut plan = preview_plan(&paths, "u-target");
         plan.expected_digest = "tampered-digest".to_string();
 
-        let error = mirror_apply_at(&paths, WbVariant::Cn, "u-target", &json!({"uid": "u-target"}), &paths.data_root, &plan).unwrap_err();
+        let error = mirror_apply_at(&paths, WbVariant::Cn, "u-target", &json!({"uid": "u-target"}), &mother_acc(), &paths.data_root, &plan).unwrap_err();
         assert!(error.contains("不一致"), "{error}");
         assert_eq!(deleted_at_of(&paths, "s-1"), None, "摘要不符零写入");
     }
@@ -3172,7 +3630,7 @@ mod tests {
         // 预览后登录态被切到别的母本：现场母本与凭据不符，双 verify 必报 STALE。
         seed_auth(&paths, "u-attacker");
 
-        let error = mirror_apply_at(&paths, WbVariant::Cn, "u-target", &json!({"uid": "u-target"}), &paths.data_root, &plan).unwrap_err();
+        let error = mirror_apply_at(&paths, WbVariant::Cn, "u-target", &json!({"uid": "u-target"}), &mother_acc(), &paths.data_root, &plan).unwrap_err();
         assert!(error.contains("过期"), "{error}");
         assert_eq!(deleted_at_of(&paths, "s-1"), None, "母本变化零写入");
     }
@@ -3194,7 +3652,7 @@ mod tests {
         let plan = preview_plan(&paths, "u-target");
         assert_eq!(plan.targets.len(), 1, "只列未软删的 s-1");
 
-        let report = mirror_apply_at(&paths, WbVariant::Cn, "u-target", &json!({"uid": "u-target"}), &paths.data_root, &plan).unwrap();
+        let report = mirror_apply_at(&paths, WbVariant::Cn, "u-target", &json!({"uid": "u-target"}), &mother_acc(), &paths.data_root, &plan).unwrap();
         assert_eq!(report.deleted_sessions, 1);
         let backup = PathBuf::from(report.backup.clone().unwrap());
         assert!(deleted_at_of(&paths, "s-1").is_some());
@@ -3222,7 +3680,7 @@ mod tests {
         let before = std::fs::read(&body).unwrap();
 
         let plan = preview_plan(&paths, "u-target");
-        mirror_apply_at(&paths, WbVariant::Cn, "u-target", &json!({"uid": "u-target"}), &paths.data_root, &plan).unwrap();
+        mirror_apply_at(&paths, WbVariant::Cn, "u-target", &json!({"uid": "u-target"}), &mother_acc(), &paths.data_root, &plan).unwrap();
 
         let after = std::fs::read(&body).unwrap();
         assert_eq!(before, after, "镜像只软删数据库行，绝不改会话正文");
@@ -3236,7 +3694,7 @@ mod tests {
         seed_session_db(&paths, &[("s-1", "u-target", 1000, None)]);
         seed_gone_mother_groups(&paths, &["s-1"]);
         let plan = preview_plan(&paths, "u-target");
-        let report = mirror_apply_at(&paths, WbVariant::Cn, "u-target", &json!({"uid": "u-target"}), &paths.data_root, &plan).unwrap();
+        let report = mirror_apply_at(&paths, WbVariant::Cn, "u-target", &json!({"uid": "u-target"}), &mother_acc(), &paths.data_root, &plan).unwrap();
         let backup = PathBuf::from(report.backup.clone().unwrap());
 
         let restored =
@@ -3252,7 +3710,7 @@ mod tests {
         seed_auth(&paths, "u-mother");
         seed_session_db(&paths, &[("s-1", "u-target", 1000, None)]);
         let plan = preview_plan(&paths, "u-target");
-        mirror_apply_at(&paths, WbVariant::Cn, "u-target", &json!({"uid": "u-target"}), &paths.data_root, &plan).unwrap(); // 确保根目录存在
+        mirror_apply_at(&paths, WbVariant::Cn, "u-target", &json!({"uid": "u-target"}), &mother_acc(), &paths.data_root, &plan).unwrap(); // 确保根目录存在
 
         let outside = dir.path().join("outside");
         std::fs::create_dir_all(&outside).unwrap();
@@ -3270,7 +3728,7 @@ mod tests {
         seed_session_db(&paths, &[("s-1", "u-target", 1000, None)]);
         seed_gone_mother_groups(&paths, &["s-1"]);
         let plan = preview_plan(&paths, "u-target");
-        let report = mirror_apply_at(&paths, WbVariant::Cn, "u-target", &json!({"uid": "u-target"}), &paths.data_root, &plan).unwrap();
+        let report = mirror_apply_at(&paths, WbVariant::Cn, "u-target", &json!({"uid": "u-target"}), &mother_acc(), &paths.data_root, &plan).unwrap();
 
         let entries = scan_mirror_backups(&paths);
         assert_eq!(entries.len(), 1);
@@ -3304,7 +3762,7 @@ mod tests {
         seed_session_db(&paths, &[("s-1", "u-target", 1000, None)]);
         seed_gone_mother_groups(&paths, &["s-1"]);
         let plan = preview_plan(&paths, "u-target");
-        let report = mirror_apply_at(&paths, WbVariant::Cn, "u-target", &json!({"uid": "u-target"}), &paths.data_root, &plan).unwrap();
+        let report = mirror_apply_at(&paths, WbVariant::Cn, "u-target", &json!({"uid": "u-target"}), &mother_acc(), &paths.data_root, &plan).unwrap();
         let file = PathBuf::from(report.backup.unwrap()).join(MIRROR_MANIFEST_FILE);
         let on_disk: MirrorBackupManifest =
             serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
@@ -3319,7 +3777,7 @@ mod tests {
         seed_session_db(&paths, &[("s-1", "u-target", 1000, None)]);
         seed_gone_mother_groups(&paths, &["s-1"]);
         let plan = preview_plan(&paths, "u-target");
-        mirror_apply_at(&paths, WbVariant::Cn, "u-target", &json!({"uid": "u-target"}), &paths.data_root, &plan).unwrap();
+        mirror_apply_at(&paths, WbVariant::Cn, "u-target", &json!({"uid": "u-target"}), &mother_acc(), &paths.data_root, &plan).unwrap();
 
         // 另造一个非镜像交易目录（只有不属于 mirror 的清单），扫描必须忽略。
         let other = session_backup::transactions_root(&paths, WbVariant::Cn).join("other-op");
@@ -3595,7 +4053,7 @@ mod tests {
             &paths,
             WbVariant::Cn,
             "u-target",
-            &target_acc,
+            &target_acc, &mother_acc(),
             &paths.data_root,
             &plan,
         )
@@ -3630,7 +4088,7 @@ mod tests {
             &paths,
             WbVariant::Cn,
             "u-target",
-            &target_acc,
+            &target_acc, &mother_acc(),
             &memory_root,
             &plan,
         )
@@ -3677,7 +4135,7 @@ mod tests {
             &paths,
             WbVariant::Cn,
             "u-target",
-            &json!({"uid": "u-target"}),
+            &json!({"uid": "u-target"}), &mother_acc(),
             &paths.data_root,
             &plan,
         )
@@ -3698,7 +4156,7 @@ mod tests {
         let plan = preview_plan(&paths, "u-target");
         assert_eq!(plan.targets.len(), 0, "目标无待删行");
 
-        let report = mirror_apply_at(&paths, WbVariant::Cn, "u-target", &target_acc, &paths.data_root, &plan).unwrap();
+        let report = mirror_apply_at(&paths, WbVariant::Cn, "u-target", &target_acc, &mother_acc(), &paths.data_root, &plan).unwrap();
         assert_eq!(report.copied_sessions, 1, "应复制 1 个母本独有会话");
         assert_eq!(report.deleted_sessions, 0);
         assert_eq!(target_active_count(&paths, "u-target"), 1, "目标库出现副本");
@@ -3718,13 +4176,13 @@ mod tests {
         let target_acc = json!({"id":"acc-u-target","uid":"u-target","variant":"cn"});
 
         let plan1 = preview_plan(&paths, "u-target");
-        let r1 = mirror_apply_at(&paths, WbVariant::Cn, "u-target", &target_acc, &paths.data_root, &plan1).unwrap();
+        let r1 = mirror_apply_at(&paths, WbVariant::Cn, "u-target", &target_acc, &mother_acc(), &paths.data_root, &plan1).unwrap();
         assert_eq!(r1.copied_sessions, 1);
 
         // 重预览：副本在含母本的组里，不算多余、不再复制、不被误软删。
         let plan2 = preview_plan(&paths, "u-target");
         assert_eq!(plan2.targets.len(), 0, "母本对端副本不算待删");
-        let r2 = mirror_apply_at(&paths, WbVariant::Cn, "u-target", &target_acc, &paths.data_root, &plan2).unwrap();
+        let r2 = mirror_apply_at(&paths, WbVariant::Cn, "u-target", &target_acc, &mother_acc(), &paths.data_root, &plan2).unwrap();
         assert_eq!(r2.copied_sessions, 0, "已关联不重复复制");
         assert_eq!(r2.deleted_sessions, 0, "副本不被误软删");
         assert_eq!(target_active_count(&paths, "u-target"), 1, "副本仍在");
@@ -3763,7 +4221,7 @@ mod tests {
         let plan = preview_plan(&paths, "u-target");
         assert_eq!(plan.targets.len(), 1, "s-extra 待软删");
 
-        let report = mirror_apply_at(&paths, WbVariant::Cn, "u-target", &target_acc, &paths.data_root, &plan).unwrap();
+        let report = mirror_apply_at(&paths, WbVariant::Cn, "u-target", &target_acc, &mother_acc(), &paths.data_root, &plan).unwrap();
         assert_eq!(report.deleted_sessions, 1, "软删成功");
         assert_eq!(report.copied_sessions, 0, "复制失败");
         assert!(!report.errors.is_empty(), "复制错误进 errors");
@@ -3776,7 +4234,7 @@ mod tests {
         let paths = copy_ready_env(&dir);
         let target_acc = json!({"id":"acc-u-target","uid":"u-target","variant":"cn"});
         let plan = preview_plan(&paths, "u-target");
-        let report = mirror_apply_at(&paths, WbVariant::Cn, "u-target", &target_acc, &paths.data_root, &plan).unwrap();
+        let report = mirror_apply_at(&paths, WbVariant::Cn, "u-target", &target_acc, &mother_acc(), &paths.data_root, &plan).unwrap();
         assert_eq!(report.copied_sessions, 1);
         assert_eq!(target_active_count(&paths, "u-target"), 1, "副本存在");
 
@@ -3807,7 +4265,7 @@ mod tests {
             &paths,
             WbVariant::Cn,
             "u-target",
-            &json!({"uid": "u-target"}),
+            &json!({"uid": "u-target"}), &mother_acc(),
             &memory_root,
             &plan,
         )
@@ -3850,7 +4308,7 @@ mod tests {
             &paths,
             WbVariant::Cn,
             "u-target",
-            &json!({"uid": "u-target"}),
+            &json!({"uid": "u-target"}), &mother_acc(),
             &memory_root,
             &plan,
         )
@@ -3906,7 +4364,7 @@ mod tests {
             &paths,
             WbVariant::Cn,
             "u-target",
-            &json!({"uid": "u-target"}),
+            &json!({"uid": "u-target"}), &mother_acc(),
             &root,
             &plan,
         )
@@ -3943,7 +4401,7 @@ mod tests {
             &paths,
             WbVariant::Cn,
             "u-target",
-            &json!({"uid": "u-target"}),
+            &json!({"uid": "u-target"}), &mother_acc(),
             &root,
             &plan,
         )
@@ -3988,7 +4446,7 @@ mod tests {
             &paths,
             WbVariant::Cn,
             "u-target",
-            &json!({"uid": "u-target"}),
+            &json!({"uid": "u-target"}), &mother_acc(),
             &root,
             &plan,
         )
@@ -4025,7 +4483,7 @@ mod tests {
             &paths,
             WbVariant::Cn,
             "u-target",
-            &json!({"uid": "u-target"}),
+            &json!({"uid": "u-target"}), &mother_acc(),
             &root,
             &plan,
         )
@@ -4198,6 +4656,7 @@ mod tests {
             title: Some(format!("{sid}-title")),
             custom_title: None,
             updated_at: 100,
+            activity_at: 100,
             deleted_at: deleted,
         };
         let rows = vec![
@@ -4257,6 +4716,7 @@ mod tests {
             title: None,
             custom_title: None,
             updated_at: 1,
+            activity_at: 1,
             deleted_at: None,
         };
         let rows = vec![row("u1", "s1"), row("u1", "s2")];
@@ -4271,5 +4731,500 @@ mod tests {
             ),
         ];
         assert!(deleted_sync_targets(&rows, &groups).is_empty());
+    }
+
+    // --- 自动同步落后副本（akasha-mirror-sync） ---------------------------
+
+    fn activity(pairs: &[(&str, i64)]) -> HashMap<String, i64> {
+        pairs.iter().map(|(id, at)| (id.to_string(), *at)).collect()
+    }
+
+    /// 母本与目标各有一条 `Active` 成员的双人组。
+    fn paired_group(id: &str, mother_sid: &str, target_sid: &str) -> LinkGroup {
+        group(
+            id,
+            vec![
+                ("u-mother", mother_sid, MemberState::Active),
+                ("u-target", target_sid, MemberState::Active),
+            ],
+        )
+    }
+
+    /// 用例内的预筛阈值：60（毫秒口径与生产常量一致，数值缩小便于书写）。
+    const TEST_MARGIN_MS: i64 = 60;
+
+    fn behind_of(
+        groups: &[LinkGroup],
+        mother: &[(&str, i64)],
+        target: &[(&str, i64)],
+    ) -> Vec<String> {
+        groups_behind_candidates(
+            groups,
+            &activity(mother),
+            &activity(target),
+            "u-mother",
+            "u-target",
+            TEST_MARGIN_MS,
+        )
+    }
+
+    /// 生产阈值就是 60 秒：一轮真实对话必然把 `last_activity_at` 推到秒级新值，
+    /// 60s 只为吃掉同一次写入被两条记录分摊的抖动。
+    #[test]
+    fn mirror_sync_margin_is_one_minute() {
+        assert_eq!(MIRROR_SYNC_MARGIN_MS, 60_000);
+    }
+
+    /// T8：查表口径。`ahead` 必须 `None` —— 镜像不得自造 `UnifyOverwrite` 绕过
+    /// `available_modes()` 的限制。
+    #[test]
+    fn auto_sync_mode_maps_only_actionable_verdicts() {
+        let cases = [
+            (SyncVerdict::FastForward, Some(SyncMode::FastForward)),
+            (SyncVerdict::Diverge, Some(SyncMode::Overwrite)),
+            (SyncVerdict::Identical, None),
+            (SyncVerdict::Ahead, None),
+            (SyncVerdict::Unknown, None),
+        ];
+        for (verdict, expected) in cases {
+            assert_eq!(auto_sync_mode(verdict), expected, "{verdict:?}");
+        }
+    }
+
+    /// T1：母本 1000 / 目标 900，差 100 > 60 → 候选。
+    #[test]
+    fn groups_behind_candidates_picks_mother_leading_group() {
+        let groups = vec![paired_group("g-1", "s-m", "s-t")];
+        assert_eq!(
+            behind_of(&groups, &[("s-m", 1000)], &[("s-t", 900)]),
+            vec!["g-1".to_string()]
+        );
+    }
+
+    /// T2 + 阈值边界：差值等于阈值（60）视为抖动不进候选，超出 1ms 才进。
+    #[test]
+    fn groups_behind_candidates_swallows_timestamp_jitter() {
+        let groups = vec![paired_group("g-1", "s-m", "s-t")];
+        assert!(
+            behind_of(&groups, &[("s-m", 1000)], &[("s-t", 940)]).is_empty(),
+            "差值恰好等于阈值：当成同一次写入的抖动"
+        );
+        assert!(
+            behind_of(&groups, &[("s-m", 1000)], &[("s-t", 941)]).is_empty(),
+            "差值 59ms：低于阈值，不进候选"
+        );
+        assert_eq!(
+            behind_of(&groups, &[("s-m", 1000)], &[("s-t", 939)]),
+            vec!["g-1".to_string()],
+            "差值 61ms：超过阈值才算母本领先"
+        );
+    }
+
+    /// T3（B6）：母本落后于目标 → 不回退，零候选。
+    #[test]
+    fn groups_behind_candidates_never_reverts_target_leading_group() {
+        let groups = vec![paired_group("g-1", "s-m", "s-t")];
+        assert!(behind_of(&groups, &[("s-m", 900)], &[("s-t", 1000)]).is_empty());
+    }
+
+    /// T4：副本缺 `last_activity_at`（历史脏数据）按 0 处理 → 必进候选。
+    #[test]
+    fn groups_behind_candidates_treats_missing_activity_as_zero() {
+        let groups = vec![paired_group("g-1", "s-m", "s-t")];
+        assert_eq!(
+            behind_of(&groups, &[("s-m", 1000)], &[]),
+            vec!["g-1".to_string()]
+        );
+    }
+
+    /// T5（B1/B2）：目标在该组没有 `Active` 成员 → 交给复制路径，不进候选。
+    #[test]
+    fn groups_behind_candidates_skips_group_without_target_active_copy() {
+        let groups = vec![
+            group("g-no-copy", vec![("u-mother", "s-m", MemberState::Active)]),
+            group(
+                "g-superseded",
+                vec![
+                    ("u-mother", "s-m", MemberState::Active),
+                    ("u-target", "s-t", MemberState::Superseded),
+                ],
+            ),
+        ];
+        assert!(
+            behind_of(&groups, &[("s-m", 1000)], &[("s-t", 100)]).is_empty(),
+            "无副本/副本已失效一律交给复制，不进同步候选"
+        );
+    }
+
+    /// T6：组内没有母本 `Active` 成员 → 无从比较。
+    #[test]
+    fn groups_behind_candidates_skips_group_without_mother_active_member() {
+        let groups = vec![
+            group("g-target-only", vec![("u-target", "s-t", MemberState::Active)]),
+            group(
+                "g-mother-stale",
+                vec![
+                    ("u-mother", "s-m", MemberState::Stale),
+                    ("u-target", "s-t", MemberState::Active),
+                ],
+            ),
+        ];
+        assert!(behind_of(&groups, &[("s-m", 1000)], &[("s-t", 100)]).is_empty());
+    }
+
+    /// T7：`count == 0` 显式化 —— 空组集返回空 `Vec`，不 panic。
+    #[test]
+    fn groups_behind_candidates_returns_empty_for_no_groups() {
+        assert!(groups_behind_candidates(
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            "u-mother",
+            "u-target",
+            MIRROR_SYNC_MARGIN_MS
+        )
+        .is_empty());
+    }
+
+    fn sample_report() -> MirrorReport {
+        MirrorReport {
+            deleted_sessions: 1,
+            copied_sessions: 2,
+            restored_copies: 0,
+            backup: None,
+            needs_recovery: false,
+            experts_updated: false,
+            experts_restored: false,
+            warnings: Vec::new(),
+            skipped: Vec::new(),
+            errors: Vec::new(),
+            unmerged: Vec::new(),
+            synced_sessions: 1,
+            overwritten_sessions: 1,
+            sync_details: vec![MirrorSyncedGroup {
+                group_id: "g-1".to_string(),
+                title: Some("组一".to_string()),
+                mode: "overwrite".to_string(),
+                overwritten: true,
+                target_records_before: 4,
+                added_records: 2,
+            }],
+            sync_errors: vec![MirrorSyncError {
+                group_id: "g-2".to_string(),
+                title: None,
+                error: "目标副本已失效，需手动处理".to_string(),
+            }],
+        }
+    }
+
+    /// T9：老载荷（没有四个同步字段）照旧可读，同步字段落到「没有」。
+    #[test]
+    fn mirror_report_defaults_sync_fields_for_legacy_payload() {
+        let legacy = json!({
+            "deletedSessions": 3,
+            "copiedSessions": 0,
+            "backup": null,
+            "needsRecovery": false,
+            "warnings": [],
+            "skipped": [],
+            "errors": [],
+        });
+        let report: MirrorReport = serde_json::from_value(legacy).unwrap();
+        assert_eq!(report.deleted_sessions, 3);
+        assert_eq!(report.synced_sessions, 0);
+        assert_eq!(report.overwritten_sessions, 0);
+        assert!(report.sync_details.is_empty());
+        assert!(report.sync_errors.is_empty());
+    }
+
+    /// T10：新报告按 camelCase 输出四个同步键，前端才读得到。
+    #[test]
+    fn mirror_report_serializes_sync_fields_in_camel_case() {
+        let value = serde_json::to_value(sample_report()).unwrap();
+        for key in [
+            "syncedSessions",
+            "overwrittenSessions",
+            "syncDetails",
+            "syncErrors",
+        ] {
+            assert!(value.get(key).is_some(), "缺少 {key}：{value}");
+        }
+        assert_eq!(value["syncedSessions"], 1);
+        assert_eq!(value["syncDetails"][0]["targetRecordsBefore"], 4);
+        assert_eq!(value["syncDetails"][0]["addedRecords"], 2);
+        assert_eq!(value["syncDetails"][0]["overwritten"], true);
+    }
+
+    fn preview_item(group_id: &str, verdict: &str, modes: &[&str], token: Option<&str>) -> Value {
+        let mut item = json!({
+            "groupId": group_id,
+            "title": format!("组-{group_id}"),
+            "verdict": verdict,
+            "availableModes": modes,
+        });
+        if let Some(token) = token {
+            item["previewToken"] = json!(token);
+        }
+        item
+    }
+
+    fn preview_of(items: Vec<Value>) -> Value {
+        json!({"storeStatus": "ready", "groups": items})
+    }
+
+    /// B4：快进组 → 追加母本新记录，目标原有内容不丢；计数只加同步数。
+    #[test]
+    fn sync_behind_copies_fast_forwards_mother_leading_group() {
+        let outcome = sync_behind_copies(
+            &["g-1".to_string()],
+            || Ok(preview_of(vec![preview_item("g-1", "fastForward", &["fastForward"], Some("tok-1"))])),
+            |selections| {
+                assert_eq!(selections.len(), 1);
+                assert_eq!(selections[0].group_id, "g-1");
+                assert_eq!(selections[0].mode, SyncMode::FastForward);
+                assert_eq!(selections[0].preview_token, "tok-1");
+                Ok(json!({
+                    "synced": [{
+                        "groupId": "g-1",
+                        "status": "synced",
+                        "mode": "fastForward",
+                        "recordCount": {"source": 5, "targetBefore": 2, "target": 5},
+                    }],
+                    "skipped": [],
+                    "errors": [],
+                }))
+            },
+        );
+        assert_eq!(outcome.synced, 1);
+        assert_eq!(outcome.overwritten, 0);
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let only = &outcome.details[0];
+        assert_eq!(only.title.as_deref(), Some("组-g-1"));
+        assert_eq!(only.mode, "fastForward");
+        assert!(!only.overwritten);
+        assert_eq!(only.target_records_before, 2);
+        assert_eq!(only.added_records, 3);
+    }
+
+    /// B5：分叉组 → 按 P1 用母本覆盖，`overwritten` 计数与 `targetRecordsBefore` 齐备。
+    #[test]
+    fn sync_behind_copies_overwrites_diverged_group() {
+        let outcome = sync_behind_copies(
+            &["g-1".to_string(), "g-2".to_string()],
+            || {
+                Ok(preview_of(vec![
+                    preview_item("g-1", "diverge", &["overwrite"], Some("tok-1")),
+                    preview_item("g-2", "diverge", &["overwrite"], Some("tok-2")),
+                ]))
+            },
+            |selections| {
+                assert_eq!(selections.len(), 2);
+                assert!(selections.iter().all(|s| s.mode == SyncMode::Overwrite));
+                Ok(json!({
+                    "synced": [{
+                        "groupId": "g-1",
+                        "status": "synced",
+                        "mode": "overwrite",
+                        "recordCount": {"source": 9, "targetBefore": 4, "target": 9},
+                    }],
+                    "skipped": [],
+                    "errors": [{"groupId": "g-2", "error": "目标内容不存在，未同步"}],
+                }))
+            },
+        );
+        assert_eq!(outcome.synced, 1);
+        assert_eq!(outcome.overwritten, 1);
+        assert_eq!(outcome.details[0].target_records_before, 4);
+        assert_eq!(outcome.details[0].added_records, 5);
+        assert_eq!(outcome.errors.len(), 1, "失败组不阻断其它组");
+        assert_eq!(outcome.errors[0].group_id, "g-2");
+        assert_eq!(outcome.errors[0].title.as_deref(), Some("组-g-2"));
+    }
+
+    /// B3/B6：identical 与 ahead 一律不写，也不产生明细或错误。
+    #[test]
+    fn sync_behind_copies_ignores_identical_and_ahead_groups() {
+        let called = std::cell::Cell::new(false);
+        let outcome = sync_behind_copies(
+            &["g-1".to_string(), "g-2".to_string()],
+            || {
+                Ok(preview_of(vec![
+                    preview_item("g-1", "identical", &[], None),
+                    preview_item("g-2", "ahead", &[], Some("tok-2")),
+                ]))
+            },
+            |_| {
+                called.set(true);
+                Ok(json!({}))
+            },
+        );
+        assert!(!called.get(), "内容一致 / 目标更新一律零写入");
+        assert_eq!(outcome.synced, 0);
+        assert!(outcome.details.is_empty());
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+    }
+
+    /// B7：不可验证的组进 `sync_errors`，不重试、不影响其它组。
+    #[test]
+    fn sync_behind_copies_reports_unknown_group_without_writing() {
+        let called = std::cell::Cell::new(false);
+        let outcome = sync_behind_copies(
+            &["g-1".to_string()],
+            || Ok(preview_of(vec![preview_item("g-1", "unknown", &[], None)])),
+            |_| {
+                called.set(true);
+                Ok(json!({}))
+            },
+        );
+        assert!(!called.get());
+        assert_eq!(outcome.errors.len(), 1);
+        assert_eq!(outcome.errors[0].error, "目标副本已失效，需手动处理");
+    }
+
+    /// B8：没有 `previewToken` 绝不构造 selection（缺 token 会让整次同步 Err）。
+    #[test]
+    fn sync_behind_copies_never_builds_selection_without_preview_token() {
+        let called = std::cell::Cell::new(false);
+        let outcome = sync_behind_copies(
+            &["g-1".to_string()],
+            || Ok(preview_of(vec![preview_item("g-1", "fastForward", &[], None)])),
+            |_| {
+                called.set(true);
+                Ok(json!({}))
+            },
+        );
+        assert!(!called.get(), "无凭据不写");
+        assert_eq!(outcome.errors.len(), 1);
+        assert_eq!(outcome.errors[0].group_id, "g-1");
+    }
+
+    /// B9：同步整体失败（加锁失败等）→ 一组一条，`mirror_apply_at` 仍是 Ok。
+    #[test]
+    fn sync_behind_copies_downgrades_whole_failure_to_group_errors() {
+        let outcome = sync_behind_copies(
+            &["g-1".to_string(), "g-2".to_string()],
+            || {
+                Ok(preview_of(vec![
+                    preview_item("g-1", "diverge", &["overwrite"], Some("tok-1")),
+                    preview_item("g-2", "fastForward", &["fastForward"], Some("tok-2")),
+                ]))
+            },
+            |_| Err("无法独占会话操作：会话操作进行中".to_string()),
+        );
+        assert_eq!(outcome.synced, 0);
+        assert_eq!(outcome.errors.len(), 2);
+        assert!(outcome
+            .errors
+            .iter()
+            .all(|item| item.error.contains("无法独占会话操作")));
+    }
+
+    /// 接线（T13/T14 的真实链路部分）：预筛出「母本领先」的组后，`mirror_apply_at` 会在
+    /// 复制之后进入同步步骤；目标正文不可读时该组进 `sync_errors` 而不是整份失败，
+    /// 目标更新的组只记 warning 不回退。
+    #[test]
+    fn mirror_apply_routes_behind_groups_into_sync_without_blocking() {
+        let dir = TempDir::new("sync-wiring");
+        let paths = paths_for(&dir);
+        seed_auth(&paths, "u-mother");
+        std::fs::create_dir_all(&paths.data_root).unwrap();
+        let conn = Connection::open(paths.workbuddy_db()).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (id TEXT, user_id TEXT, title TEXT, custom_title TEXT, \
+             updated_at INTEGER, deleted_at INTEGER);",
+        )
+        .unwrap();
+        // g-1：母本更活跃 → 落后副本候选；g-2：目标更活跃 → 只记 warning，绝不回退。
+        for (id, uid, title, updated_at) in [
+            ("m-behind", "u-mother", "母本领先", 100_000),
+            ("t-behind", "u-target", "目标落后", 1_000),
+            ("m-ahead", "u-mother", "母本落后", 1_000),
+            ("t-ahead", "u-target", "目标领先", 100_000),
+        ] {
+            conn.execute(
+                "INSERT INTO sessions VALUES (?1, ?2, ?3, NULL, ?4, NULL)",
+                rusqlite::params![id, uid, title, updated_at],
+            )
+            .unwrap();
+        }
+        drop(conn);
+        let econn = Connection::open(paths.edge_sync_db(WbVariant::Cn)).unwrap();
+        econn
+            .execute_batch(
+                "CREATE TABLE edge_sync_mapping (session_id TEXT, conversation_id TEXT, \
+                 msg_channel TEXT, created_at INTEGER);",
+            )
+            .unwrap();
+        drop(econn);
+        write_link_store(
+            &paths,
+            vec![
+                group(
+                    "g-1",
+                    vec![
+                        ("u-mother", "m-behind", MemberState::Active),
+                        ("u-target", "t-behind", MemberState::Active),
+                    ],
+                ),
+                group(
+                    "g-2",
+                    vec![
+                        ("u-mother", "m-ahead", MemberState::Active),
+                        ("u-target", "t-ahead", MemberState::Active),
+                    ],
+                ),
+            ],
+        );
+
+        let plan = preview_plan(&paths, "u-target");
+        assert!(
+            plan.targets.is_empty(),
+            "母本仍持有这两段对话，不该软删：{:?}",
+            plan.targets
+        );
+        let report = mirror_apply_at(
+            &paths,
+            WbVariant::Cn,
+            "u-target",
+            &json!({"uid": "u-target"}),
+            &mother_acc(),
+            &paths.data_root,
+            &plan,
+        )
+        .unwrap();
+
+        assert_eq!(report.synced_sessions, 0);
+        assert_eq!(report.overwritten_sessions, 0);
+        assert!(report.sync_details.is_empty());
+        // 测试环境没有正文文件 → 判定不可验证，必须进 sync_errors 而不是 Err。
+        assert_eq!(report.sync_errors.len(), 1, "{:?}", report.sync_errors);
+        assert_eq!(report.sync_errors[0].group_id, "g-1");
+        assert_eq!(report.sync_errors[0].error, "目标副本已失效，需手动处理");
+        // 目标更新的那组零写入，但要在 warnings 里说清「没有回退」。
+        assert!(
+            report.warnings.iter().any(|line| line.contains("未回退")),
+            "{:?}",
+            report.warnings
+        );
+    }
+
+    /// 候选为空（`count == 0`）时不读预览、不写任何东西。
+    #[test]
+    fn sync_behind_copies_does_nothing_without_candidates() {
+        let called = std::cell::Cell::new(false);
+        let outcome = sync_behind_copies(
+            &[],
+            || {
+                called.set(true);
+                Ok(preview_of(Vec::new()))
+            },
+            |_| {
+                called.set(true);
+                Ok(json!({}))
+            },
+        );
+        assert!(!called.get(), "无候选不得触发任何 IO");
+        assert_eq!(outcome.synced, 0);
+        assert!(outcome.details.is_empty() && outcome.errors.is_empty());
     }
 }

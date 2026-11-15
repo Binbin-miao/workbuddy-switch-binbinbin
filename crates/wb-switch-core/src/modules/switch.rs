@@ -174,6 +174,11 @@ fn mirror_report_json(result: Result<mirror::MirrorReport, String>) -> Value {
         }],
         // 镜像整体失败时没有可用快照，空清单是正确语义。
         unmerged: Vec::new(),
+        // 整体失败时一组都没同步，四个同步字段为「没有」。
+        synced_sessions: 0,
+        overwritten_sessions: 0,
+        sync_details: Vec::new(),
+        sync_errors: Vec::new(),
     });
     serde_json::to_value(&report).unwrap_or(Value::Null)
 }
@@ -391,11 +396,17 @@ pub fn switch_account(
             progress("正在执行整份镜像…");
             let target_uid = acc.get("uid").and_then(Value::as_str).unwrap_or_default();
             let paths = SessionPaths::for_variant(variant);
+            // 母本恒为「切换前仍处于登录态」的账号：认证尚未写入，登录态就是母本。
+            // 账号库按 id 或 uid 都能查到（`account::find_account` 两者皆匹配）。
+            let mother_acc = session::current_user_uid_at(&paths.auth_file)
+                .and_then(|mother_uid| account::find_account(&mother_uid))
+                .unwrap_or(Value::Null);
             mirror_report = Some(mirror_report_json(mirror::mirror_apply_at(
                 &paths,
                 variant,
                 target_uid,
                 &acc,
+                &mother_acc,
                 // 人格目录只挂在数据根下（与档位无关），生产恒取真实数据根。
                 &crate::modules::config::wb_data_root(),
                 plan,
@@ -922,6 +933,10 @@ mod tests {
             skipped: Vec::new(),
             errors: Vec::new(),
             unmerged: Vec::new(),
+            synced_sessions: 0,
+            overwritten_sessions: 0,
+            sync_details: Vec::new(),
+            sync_errors: Vec::new(),
         }));
         assert_eq!(ok["deletedSessions"], 3);
         assert_eq!(ok["backup"], "/x");

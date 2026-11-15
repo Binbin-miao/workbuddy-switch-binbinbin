@@ -2453,6 +2453,7 @@ pub fn session_links_preview_cross_with_progress(
         target_acc,
         SessionPaths::for_variant,
         progress,
+        None,
     )
 }
 
@@ -2475,6 +2476,34 @@ fn session_links_preview_cross_at(
         target_acc,
         resolve_source_paths,
         None,
+        None,
+    )
+}
+
+/// 只预览指定关联组（镜像层用；`only_group_ids` 为空即全量）。
+///
+/// 空切片与旧入口等价：不传组号就没有过滤条件，输出与 [`session_links_preview_cross`]
+/// 逐字一致。存在性检查交给上游——这里只回答「这些组各自可不可以写」。
+///
+/// 同档可注入版本：两侧共用同一份路径与档位（整份镜像只作用于目标账号所在档位，
+/// 源就是该档位的登录账号）。
+pub(crate) fn session_links_preview_cross_for_groups_at(
+    paths: &SessionPaths,
+    variant: WbVariant,
+    source_acc: &Value,
+    target_acc: &Value,
+    only_group_ids: &[String],
+) -> Result<Value, String> {
+    session_links_preview_cross_at_with_progress(
+        paths,
+        variant,
+        source_acc,
+        paths,
+        variant,
+        target_acc,
+        SessionPaths::for_variant,
+        None,
+        Some(only_group_ids),
     )
 }
 
@@ -2487,6 +2516,7 @@ fn session_links_preview_cross_at_with_progress(
     target_acc: &Value,
     resolve_source_paths: impl Fn(WbVariant) -> SessionPaths,
     progress: Option<PreviewProgressFn<'_>>,
+    only_group_ids: Option<&[String]>,
 ) -> Result<Value, String> {
     let source_uid = account_uid(source_acc);
     if source_uid.is_empty() {
@@ -2551,6 +2581,13 @@ fn session_links_preview_cross_at_with_progress(
                 .iter()
                 .filter(|group| {
                     has_member_for(group, &source_uid) && has_member_for(group, &target_uid)
+                })
+                // 只要指定组时与候选集求交：镜像只为自己的候选组付内容预览的代价，
+                // 其余组连正文都不读。`None` 与空切片（`count == 0`）都表示不过滤，
+                // 旧入口行为逐字不变。
+                .filter(|group| match only_group_ids {
+                    Some(ids) if !ids.is_empty() => ids.iter().any(|id| id == &group.id),
+                    _ => true,
                 })
                 .collect();
             report["groups"] = json!(preview_groups_with_progress(
@@ -3178,8 +3215,53 @@ pub fn sync_sessions_cross(
 ) -> Result<Value, String> {
     let source_variant = account::variant_of(source_acc);
     let target_variant = account::variant_of(target_acc);
-    let source_paths = SessionPaths::for_variant(source_variant);
-    let target_paths = SessionPaths::for_variant(target_variant);
+    sync_sessions_cross_pair_at(
+        &SessionPaths::for_variant(source_variant),
+        source_variant,
+        source_acc,
+        &SessionPaths::for_variant(target_variant),
+        target_variant,
+        target_acc,
+        selections,
+        process::is_workbuddy_running,
+    )
+}
+
+/// [`sync_sessions_cross`] 的同档可注入版本：两侧共用同一份路径与档位。
+///
+/// 镜像层用这个入口——整份镜像只作用于目标账号所在档位，源就是该档位的登录账号。
+/// 档位操作锁仍由 [`sync_sessions_cross_at`] 内部获取（顺序固定），调用方不得预先加锁。
+pub(crate) fn sync_sessions_cross_same_variant_at(
+    paths: &SessionPaths,
+    variant: WbVariant,
+    source_acc: &Value,
+    target_acc: &Value,
+    selections: &[SyncSelection],
+    is_app_running: impl Fn(WbVariant) -> bool,
+) -> Result<Value, String> {
+    sync_sessions_cross_pair_at(
+        paths,
+        variant,
+        source_acc,
+        paths,
+        variant,
+        target_acc,
+        selections,
+        is_app_running,
+    )
+}
+
+/// [`sync_sessions_cross`] 的实现：两侧路径与探针由调用方注入。
+fn sync_sessions_cross_pair_at(
+    source_paths: &SessionPaths,
+    source_variant: WbVariant,
+    source_acc: &Value,
+    target_paths: &SessionPaths,
+    target_variant: WbVariant,
+    target_acc: &Value,
+    selections: &[SyncSelection],
+    is_app_running: impl Fn(WbVariant) -> bool,
+) -> Result<Value, String> {
     let source_uid = account_uid(source_acc);
     if source_uid.is_empty() {
         return Err("源账号缺少 uid，无法同步会话".to_string());
@@ -3189,7 +3271,7 @@ pub fn sync_sessions_cross(
         return Err("目标账号缺少 uid，无法同步会话".to_string());
     }
     let source = CopySide {
-        paths: &source_paths,
+        paths: source_paths,
         variant: source_variant,
         uid: source_uid,
         account_id: nonempty_text(
@@ -3200,7 +3282,7 @@ pub fn sync_sessions_cross(
         ),
     };
     let target = CopySide {
-        paths: &target_paths,
+        paths: target_paths,
         variant: target_variant,
         uid: target_uid,
         account_id: nonempty_text(
@@ -3214,7 +3296,7 @@ pub fn sync_sessions_cross(
         &source,
         &target,
         selections,
-        process::is_workbuddy_running,
+        is_app_running,
         SessionPaths::for_variant,
     )
 }
@@ -8367,6 +8449,72 @@ mod tests {
         .unwrap();
         assert!(report.get("sourceVariant").is_none());
         assert_eq!(report["groups"][0]["verdict"], "identical");
+    }
+
+    /// 只预览指定组：其余组不出现；该组的判定、可选模式与记录数与全量预览同组逐项一致，
+    /// 且空切片与旧入口（`None`）等价 —— 镜像层只为自己的候选组付内容预览的代价。
+    #[test]
+    fn cross_preview_for_groups_filters_to_requested_ids() {
+        let env = CrossEnv::new("preview-only-groups");
+        env.create_db(WbVariant::Cn, "");
+        env.create_edge_db(WbVariant::Cn);
+        for (session_id, title) in [("sess-1", "标题一"), ("sess-2", "标题二")] {
+            env.add_session(WbVariant::Cn, session_id, "uid-a", title);
+            env.add_body(WbVariant::Cn, session_id, &body_text(session_id));
+        }
+        cross_copy(
+            &env,
+            WbVariant::Cn,
+            "uid-a",
+            WbVariant::Cn,
+            "uid-b",
+            &["sess-1", "sess-2"],
+        );
+
+        let paths = env.paths(WbVariant::Cn);
+        let source_acc = json!({"id": "acc-uid-a", "uid": "uid-a", "variant": "cn"});
+        let target_acc = json!({"id": "acc-uid-b", "uid": "uid-b", "variant": "cn"});
+        let full = session_links_preview_cross_at(
+            &paths,
+            WbVariant::Cn,
+            &source_acc,
+            &paths,
+            WbVariant::Cn,
+            &target_acc,
+            |variant| env.paths(variant),
+        )
+        .unwrap();
+        let all_groups = full["groups"].as_array().unwrap();
+        assert_eq!(all_groups.len(), 2, "两个会话各成一个组：{full}");
+
+        let only_id = all_groups[0]["groupId"].as_str().unwrap().to_string();
+        let filtered = session_links_preview_cross_for_groups_at(
+            &paths,
+            WbVariant::Cn,
+            &source_acc,
+            &target_acc,
+            std::slice::from_ref(&only_id),
+        )
+        .unwrap();
+        let kept = filtered["groups"].as_array().unwrap();
+        assert_eq!(kept.len(), 1, "只保留请求的那一个组：{filtered}");
+        assert_eq!(kept[0]["groupId"], only_id.as_str());
+        let full_item = &all_groups[0];
+        for field in ["verdict", "availableModes", "recordCount", "title"] {
+            assert_eq!(kept[0][field], full_item[field], "字段 {field} 必须与全量一致");
+        }
+
+        // 空切片 = 不过滤：与旧入口（`only_group_ids = None`）逐字等价。
+        let unlimited = session_links_preview_cross_for_groups_at(
+            &paths,
+            WbVariant::Cn,
+            &source_acc,
+            &target_acc,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(unlimited["groups"].as_array().unwrap().len(), 2);
+        assert_eq!(unlimited["storeStatus"], full["storeStatus"]);
     }
 
     /// 跨档同步的公共准备：CN 源 sess-1 → AI 目标复制建组，返回（环境、源/目标路径、newId）。

@@ -381,6 +381,27 @@ export interface MirrorPlan {
   previewToken: string;
 }
 
+/** 镜像执行时自动同步成功的一个关联组（母本领先、目标落后的副本已补齐）。 */
+export interface MirrorSyncDetail {
+  groupId: string;
+  /** 组展示名（取母本会话标题）；旧后端可能为 null。 */
+  title: string | null;
+  mode: "fastForward" | "overwrite";
+  /** 是否以母本整份覆盖了目标（分叉组）：界面据此逐条列出被覆盖组名。 */
+  overwritten: boolean;
+  /** 覆盖前目标正文的记录数。 */
+  targetRecordsBefore: number;
+  /** 本次追加或覆盖后新增的记录数。 */
+  addedRecords: number;
+}
+
+/** 镜像执行时自动同步失败的一个关联组；失败不阻断切号。 */
+export interface MirrorSyncError {
+  groupId: string;
+  title: string | null;
+  error: string;
+}
+
 /** 镜像切换执行报告：备份路径明文、中间态可还原、绝不伪装成成功。 */
 export interface MirrorReport {
   /** 本次软删的会话数。 */
@@ -403,6 +424,14 @@ export interface MirrorReport {
   errors: { sessionId: string; error: string }[];
   /** 本次执行后仍缺的组层面合并缺口；还原/删除同步恒为空，旧后端不返回该字段。 */
   unmerged?: MirrorUnmergedItem[];
+  /** 本次自动同步成与母本一致的组数（旧后端不返回该字段，不显示 0 占位）。 */
+  syncedSessions?: number;
+  /** 其中以母本整份覆盖目标（分叉组）的组数。 */
+  overwrittenSessions?: number;
+  /** 逐组同步明细。 */
+  syncDetails?: MirrorSyncDetail[];
+  /** 逐组同步失败；失败不阻断切号。 */
+  syncErrors?: MirrorSyncError[];
 }
 
 /** 已同步的关联组（保留目标 sessionId 与标题）。 */
