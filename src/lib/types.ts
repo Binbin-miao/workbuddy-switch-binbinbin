@@ -1503,3 +1503,207 @@ export interface ArchiveImportResult {
   accountsAdded: number;
   accountsUpdated: number;
 }
+
+// ---------------------------------------------------------------------------
+// 存储管理
+//
+// 响应字段沿用后端的 snake_case（桌面端与 webui 走同一份 `serde_json` 输出）；
+// 除少数全量字段外一律 optional，老后端缺字段时前端按空态降级而不是白屏。
+// ---------------------------------------------------------------------------
+
+/** 存储分类 id；与后端 `StorageCategory::id()` 一一对应。 */
+export type StorageCategoryId = "tool" | "client" | "sessions" | "trash";
+
+/** 待删除条目的类型。同一路径「删目录」与「删其中单个文件」的安全等级不同。 */
+export type StorageEntryKind = "dir" | "file";
+
+/**
+ * 单个分类的体积汇总。
+ *
+ * 零值口径：`bytes === 0 && !partial` 是真的空；`partial === true` 表示扫描被
+ * 权限或超时截断，体积可能偏小——界面必须如实提示，不能当成「0 B」。
+ */
+export interface CategoryUsage {
+  category: StorageCategoryId;
+  bytes: number;
+  files: number;
+  /** 扫描超时或权限不足导致的不完整。 */
+  partial: boolean;
+  /** 分类根是否存在（false = 该客户端未安装或从未产生数据）。 */
+  exists: boolean;
+  /** 该分类的代表根路径（「打开目录」直接用，前端不拼路径）。 */
+  path?: string;
+}
+
+/** 回收站条目；`manifest_ok === false` 时禁止还原，只允许彻底删除。 */
+export interface TrashEntry {
+  id: string;
+  created_at?: number;
+  bytes?: number;
+  items?: number;
+  reason?: string;
+  manifest_ok?: boolean;
+}
+
+/** `GET /api/storage/scan` 负载。 */
+export interface StorageSnapshot {
+  generated_at?: number;
+  usage?: CategoryUsage[];
+  trash?: TrashEntry[];
+  trash_bytes?: number;
+}
+
+/** 会话资产明细行。 */
+export interface SessionAsset {
+  path: string;
+  project?: string;
+  name?: string;
+  variant?: WbVariant;
+  bytes?: number;
+  files?: number;
+  modified_at?: number;
+}
+
+/** 清理计划里的一条待删项。 */
+export interface CleanEntry {
+  path: string;
+  bytes?: number;
+  kind?: StorageEntryKind;
+  reason?: string;
+  variant?: WbVariant;
+}
+
+/** 被跳过的目标及原因（受保护 / 权限不足 / 时间未到）。 */
+export interface CleanSkip {
+  path: string;
+  why: string;
+}
+
+/** 只读清理计划。 */
+export interface CleanPlan {
+  category?: StorageCategoryId;
+  entries?: CleanEntry[];
+  skipped?: CleanSkip[];
+  bytes?: number;
+}
+
+/** 执行结果；`dry_run === true` 时 `moved` 表示「将会移动多少项」。 */
+export interface CleanOutcome {
+  dry_run?: boolean;
+  trash_id?: string | null;
+  moved?: number;
+  bytes?: number;
+  skipped?: CleanSkip[];
+}
+
+export interface StorageCleanResult {
+  ok: boolean;
+  plan?: CleanPlan;
+  outcome?: CleanOutcome;
+}
+
+export interface TrashList {
+  entries?: TrashEntry[];
+  count?: number;
+  bytes?: number;
+}
+
+export interface RestoreOutcome {
+  id?: string;
+  restored?: number;
+  skipped?: string[];
+}
+
+export interface PurgeOutcome {
+  purged?: number;
+  bytes?: number;
+}
+
+export interface SessionAssetList {
+  assets?: SessionAsset[];
+  count?: number;
+}
+
+/** `revalidate` 结果；`signature` 由前端回传做下一轮比较。 */
+export interface StorageRevalidateResult {
+  changed: boolean;
+  signature: string;
+}
+
+// ---------------------------------------------------------------------------
+// 设置跨账号同步（只碰 preferences.json）
+// ---------------------------------------------------------------------------
+
+export interface SettingsSyncConfig {
+  enabled: boolean;
+  lastRunAt?: number | null;
+}
+
+export interface SettingsSyncPreview {
+  from_uid: string;
+  to_uid: string;
+  variant: WbVariant;
+  /** 将被覆盖的键。 */
+  keys_changed: string[];
+  /** 目标独有、保持原样的键。 */
+  keys_kept: string[];
+  /** 非空表示这次不能同步，直接展示这句话。 */
+  blocked?: string | null;
+}
+
+export interface SettingsSyncOutcome {
+  /** 备份目录；空串表示本次没有需要写入的键、未生成备份。 */
+  backup_dir?: string;
+  keys_written?: string[];
+  keys_kept?: string[];
+  note?: string | null;
+}
+
+export interface SettingsSyncApplyResult {
+  ok: boolean;
+  outcome?: SettingsSyncOutcome;
+}
+
+export interface SettingsBackupEntry {
+  ts: string;
+  path: string;
+  bytes: number;
+}
+
+export interface SettingsBackupList {
+  backups?: SettingsBackupEntry[];
+  count?: number;
+}
+
+// ---------------------------------------------------------------------------
+// 领取台账（前端只读）
+// ---------------------------------------------------------------------------
+
+export type ClaimState = "done" | "partial" | "nothing" | "unknown";
+
+/** 当日汇总。`state = "unknown"` 表示官方暂不可查，不是「没得领」。 */
+export interface ClaimLedgerSummary {
+  state: ClaimState;
+  remaining: number;
+  day: string;
+}
+
+export interface ClaimLedgerEntry {
+  day: string;
+  uid: string;
+  variant: string;
+  total: number;
+  claimed: number;
+  claimable: number;
+  checkin_ok?: boolean | null;
+  state: ClaimState;
+  /** `"local"` | `"server"`。 */
+  source: string;
+  updated_at?: number;
+}
+
+export interface ClaimLedgerEntries {
+  entries?: ClaimLedgerEntry[];
+  count?: number;
+  day?: string;
+}

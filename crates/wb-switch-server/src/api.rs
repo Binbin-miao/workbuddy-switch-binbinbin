@@ -23,12 +23,12 @@ use serde::Serialize;
 use serde_json::{json, Value};
 
 use wb_switch_core::modules::{
-    account, archive, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, codebuddy_ide,
-    codebuddy_ide_session, codebuddy_ide_session_sync, config, credit_usage, credits,
+    account, archive, auth_file, checkin, claim_ledger, codebuddy_cli, codebuddy_cn_ide,
+    codebuddy_ide, codebuddy_ide_session, codebuddy_ide_session_sync, config, credit_usage, credits,
     export_import, jetbrains, limits, memory, mirror, notifications, oauth, process,
-    rate_limit_events, rate_limit_hook, refresh, rotate, session, session_groups, switch,
-    token_stats, travel, update, variant::WbVariant, vscode_ext, vscode_session,
-    vscode_session_sync, web_activity,
+    rate_limit_events, rate_limit_hook, refresh, rotate, session, session_groups, settings_sync,
+    storage, switch, task_center, token_stats, travel, update, variant::WbVariant, vscode_ext,
+    vscode_session, vscode_session_sync, web_activity,
 };
 
 /// 归档接口的请求体上限。
@@ -349,6 +349,23 @@ pub fn router() -> Router {
             "/api/archive/import",
             post(api_archive_import).layer(DefaultBodyLimit::max(ARCHIVE_BODY_LIMIT)),
         )
+        .route("/api/storage/scan", get(api_storage_scan))
+        .route("/api/storage/sessions", get(api_storage_sessions))
+        .route("/api/storage/clean", post(api_storage_clean))
+        .route("/api/storage/trash", get(api_storage_trash))
+        .route("/api/storage/trash/restore", post(api_storage_trash_restore))
+        .route("/api/storage/trash/purge", post(api_storage_trash_purge))
+        .route("/api/storage/reveal", post(api_storage_reveal))
+        .route("/api/storage/revalidate", post(api_storage_revalidate))
+        .route("/api/task-center", get(api_task_center))
+        .route("/api/settings-sync/config", get(api_settings_sync_config))
+        .route("/api/settings-sync/config", post(api_settings_sync_set_config))
+        .route("/api/settings-sync/preview", post(api_settings_sync_preview))
+        .route("/api/settings-sync/apply", post(api_settings_sync_apply))
+        .route("/api/settings-sync/backups", get(api_settings_sync_backups))
+        .route("/api/settings-sync/restore", post(api_settings_sync_restore))
+        .route("/api/claim-ledger/summary", get(api_claim_ledger_summary))
+        .route("/api/claim-ledger/entries", get(api_claim_ledger_entries))
         .fallback(static_handler)
 }
 
@@ -2275,12 +2292,408 @@ async fn api_clear_notifications() -> Response {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 存储管理
+// ---------------------------------------------------------------------------
+
+/// 存储页签名缓存：3 秒内不重复计算（N8 的「不装文件监听、用 revalidate 代替」）。
+///
+/// 只缓存**签名计算**这一层，`changed` 仍按调用方回传的 signature 现算，
+/// 否则不同调用方会互相污染 `changed` 结论。
+static STORAGE_SIGNATURE_CACHE: Mutex<Option<(i64, String, String)>> = Mutex::new(None);
+
+fn storage_signature_throttled(page: &str) -> String {
+    let now = config::now_ms();
+    if let Ok(guard) = STORAGE_SIGNATURE_CACHE.lock() {
+        if let Some((at, cached_page, signature)) = guard.as_ref() {
+            if cached_page == page
+                && now.saturating_sub(*at) < storage::REVALIDATE_DEBOUNCE_MS
+            {
+                return signature.clone();
+            }
+        }
+    }
+    let signature = storage::page_signature(page);
+    if let Ok(mut guard) = STORAGE_SIGNATURE_CACHE.lock() {
+        *guard = Some((now, page.to_string(), signature.clone()));
+    }
+    signature
+}
+
+/// GET /api/storage/scan —— 四分类体积总览（后端 60 秒共享快照，前端不再二次缓存）。
+async fn api_storage_scan() -> Response {
+    match tokio::task::spawn_blocking(storage::shared_snapshot).await {
+        Ok(snapshot) => json_ok(snapshot),
+        Err(error) => json_err(
+            format!("读取存储快照失败: {error}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    }
+}
+
+/// GET /api/storage/sessions?limit= —— 会话资产明细（默认 200 条）。
+async fn api_storage_sessions(RawQuery(query): RawQuery) -> Response {
+    let limit = query_param(query.as_deref(), "limit")
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .unwrap_or(200)
+        .min(2_000);
+    match tokio::task::spawn_blocking(move || storage::list_session_assets(limit)).await {
+        Ok(assets) => {
+            let count = assets.len();
+            json_ok(json!({ "assets": assets, "count": count }))
+        }
+        Err(error) => json_err(
+            format!("列出会话资产失败: {error}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    }
+}
+
+/// POST /api/storage/clean —— body `{category, older_than_days?, dry_run}`。
+///
+/// `dry_run` **默认 true**：不传就只回计划，必须显式 `false` 才真的移入回收站。
+async fn api_storage_clean(Json(body): Json<Value>) -> Response {
+    let Some(category) = body
+        .get("category")
+        .and_then(Value::as_str)
+        .and_then(storage::StorageCategory::parse)
+    else {
+        return json_err(
+            "缺少或无法识别的 category".to_string(),
+            StatusCode::BAD_REQUEST,
+        );
+    };
+    if !category.is_cleanable() {
+        return json_err(
+            "回收站只能彻底删除，不参与清理".to_string(),
+            StatusCode::BAD_REQUEST,
+        );
+    }
+    let older_than_days = body
+        .get("older_than_days")
+        .and_then(Value::as_u64)
+        .map(|days| days as u32);
+    let dry_run = body
+        .get("dry_run")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let planned = tokio::task::spawn_blocking(move || {
+        storage::plan_clean(category, older_than_days)
+    })
+    .await;
+    let plan = match planned {
+        Ok(Ok(plan)) => plan,
+        Ok(Err(error)) => return json_err(error, StatusCode::BAD_REQUEST),
+        Err(error) => {
+            return json_err(
+                format!("生成清理计划失败: {error}"),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            )
+        }
+    };
+    let plan_json = serde_json::to_value(&plan).unwrap_or(Value::Null);
+    match tokio::task::spawn_blocking(move || storage::execute_clean(&plan, dry_run)).await {
+        Ok(Ok(outcome)) => json_ok(json!({ "ok": true, "plan": plan_json, "outcome": outcome })),
+        // 客户端运行中（P3）属可恢复冲突，用 409 而不是 500。
+        Ok(Err(error)) => json_err(error, StatusCode::CONFLICT),
+        Err(error) => json_err(
+            format!("执行清理失败: {error}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    }
+}
+
+/// GET /api/storage/trash —— 回收站列表。
+async fn api_storage_trash() -> Response {
+    match tokio::task::spawn_blocking(storage::list_trash).await {
+        Ok(entries) => {
+            let count = entries.len();
+            let bytes: u64 = entries.iter().map(|entry| entry.bytes).sum();
+            json_ok(json!({ "entries": entries, "count": count, "bytes": bytes }))
+        }
+        Err(error) => json_err(
+            format!("读取回收站失败: {error}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    }
+}
+
+/// POST /api/storage/trash/restore —— body `{id, overwrite}`。
+async fn api_storage_trash_restore(Json(body): Json<Value>) -> Response {
+    let id = body.get("id").and_then(Value::as_str).unwrap_or("");
+    if id.trim().is_empty() {
+        return json_err("缺少 id".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let id = id.to_string();
+    let overwrite = body
+        .get("overwrite")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    match tokio::task::spawn_blocking(move || storage::restore_trash(&id, overwrite)).await {
+        Ok(Ok(outcome)) => json_ok(json!({ "ok": true, "outcome": outcome })),
+        // 清单损坏 / 条目不存在都属客户端可纠正的问题，409 让前端能给出可读原因。
+        Ok(Err(error)) => json_err(error, StatusCode::CONFLICT),
+        Err(error) => json_err(
+            format!("还原回收站条目失败: {error}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    }
+}
+
+/// POST /api/storage/trash/purge —— body `{id?}`，缺省清空全部（唯一不可恢复动作）。
+async fn api_storage_trash_purge(Json(body): Json<Value>) -> Response {
+    let id = body
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .filter(|id| !id.trim().is_empty());
+    match tokio::task::spawn_blocking(move || storage::purge_trash(id.as_deref())).await {
+        Ok(Ok(outcome)) => json_ok(json!({ "ok": true, "outcome": outcome })),
+        Ok(Err(error)) => json_err(error, StatusCode::CONFLICT),
+        Err(error) => json_err(
+            format!("彻底删除回收站条目失败: {error}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    }
+}
+
+/// POST /api/storage/reveal —— body `{path}`；非桌面宿主回 501 并给出可读原因。
+async fn api_storage_reveal(Json(body): Json<Value>) -> Response {
+    if !storage::reveal_supported() {
+        return json_err(
+            "在文件管理器中定位仅在桌面端支持（当前为浏览器 / 服务端模式）".to_string(),
+            StatusCode::NOT_IMPLEMENTED,
+        );
+    }
+    let path = body.get("path").and_then(Value::as_str).unwrap_or("");
+    if path.trim().is_empty() {
+        return json_err("缺少 path".to_string(), StatusCode::BAD_REQUEST);
+    }
+    match storage::reveal(Path::new(path)) {
+        Ok(()) => json_ok(json!({ "ok": true })),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// POST /api/storage/revalidate —— body `{page, signature}`，只校验当前页的一层。
+async fn api_storage_revalidate(Json(body): Json<Value>) -> Response {
+    let page = body.get("page").and_then(Value::as_str).unwrap_or("").to_string();
+    let signature = body
+        .get("signature")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let computed = tokio::task::spawn_blocking({
+        let page = page.clone();
+        move || storage_signature_throttled(&page)
+    })
+    .await;
+    let Ok(computed) = computed else {
+        return json_err(
+            "校验存储页面失败".to_string(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        );
+    };
+    if computed.is_empty() {
+        // 未登记的页面：不谎报变化。
+        return json_ok(json!({ "changed": false, "signature": "" }));
+    }
+    json_ok(json!({
+        "changed": computed != signature,
+        "signature": computed,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// 设置跨账号同步 / 领取台账 / 成长任务
+// ---------------------------------------------------------------------------
+
+/// 跨档位同步是「可恢复冲突」（409），其余是参数问题（400）。
+fn settings_sync_status(error: &str) -> StatusCode {
+    if error.contains("不互通") {
+        StatusCode::CONFLICT
+    } else {
+        StatusCode::BAD_REQUEST
+    }
+}
+
+fn body_text(body: &Value, key: &str) -> String {
+    body.get(key)
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+/// GET /api/settings-sync/config —— 开关 + 最近一次同步时刻。
+async fn api_settings_sync_config() -> Response {
+    let config = settings_sync::load_config();
+    let last = config
+        .last_run_at
+        .or_else(|| settings_sync::last_run_at(&config::store_dir()));
+    json_ok(json!({ "enabled": config.enabled, "lastRunAt": last }))
+}
+
+/// POST /api/settings-sync/config —— body `{enabled}`。
+async fn api_settings_sync_set_config(Json(body): Json<Value>) -> Response {
+    let Some(enabled) = body.get("enabled").and_then(Value::as_bool) else {
+        return json_err("缺少 enabled".to_string(), StatusCode::BAD_REQUEST);
+    };
+    let mut config = settings_sync::load_config();
+    config.enabled = enabled;
+    match settings_sync::save_config(&config) {
+        Ok(()) => json_ok(json!({ "ok": true, "enabled": config.enabled })),
+        Err(error) => json_err(error, StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+/// POST /api/settings-sync/preview —— body `{from_uid, to_uid}`。
+async fn api_settings_sync_preview(Json(body): Json<Value>) -> Response {
+    let from_uid = body_text(&body, "from_uid");
+    let to_uid = body_text(&body, "to_uid");
+    if from_uid.is_empty() || to_uid.is_empty() {
+        return json_err("缺少 from_uid / to_uid".to_string(), StatusCode::BAD_REQUEST);
+    }
+    match tokio::task::spawn_blocking(move || settings_sync::preview(&from_uid, &to_uid)).await {
+        Ok(Ok(preview)) => json_ok(preview),
+        Ok(Err(error)) => json_err(error, StatusCode::BAD_REQUEST),
+        Err(error) => json_err(
+            format!("预览设置同步失败: {error}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    }
+}
+
+/// POST /api/settings-sync/apply —— body `{from_uid, to_uid, keys?}`。
+async fn api_settings_sync_apply(Json(body): Json<Value>) -> Response {
+    let from_uid = body_text(&body, "from_uid");
+    let to_uid = body_text(&body, "to_uid");
+    if from_uid.is_empty() || to_uid.is_empty() {
+        return json_err("缺少 from_uid / to_uid".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let keys: Option<Vec<String>> = body.get("keys").and_then(Value::as_array).map(|items| {
+        items
+            .iter()
+            .filter_map(|item| item.as_str().map(String::from))
+            .collect()
+    });
+    let result = tokio::task::spawn_blocking(move || {
+        settings_sync::apply(&from_uid, &to_uid, keys.as_deref())
+    })
+    .await;
+    match result {
+        Ok(Ok(outcome)) => json_ok(json!({ "ok": true, "outcome": outcome })),
+        Ok(Err(error)) => json_err(error.clone(), settings_sync_status(&error)),
+        Err(error) => json_err(
+            format!("执行设置同步失败: {error}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    }
+}
+
+/// GET /api/settings-sync/backups?uid= —— 备份列表。
+async fn api_settings_sync_backups(RawQuery(query): RawQuery) -> Response {
+    let uid = query_param(query.as_deref(), "uid").unwrap_or_default();
+    if uid.trim().is_empty() {
+        return json_err("缺少 uid".to_string(), StatusCode::BAD_REQUEST);
+    }
+    match tokio::task::spawn_blocking(move || settings_sync::list_backups(&uid)).await {
+        Ok(entries) => {
+            let count = entries.len();
+            json_ok(json!({ "backups": entries, "count": count }))
+        }
+        Err(error) => json_err(
+            format!("读取设置备份失败: {error}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    }
+}
+
+/// POST /api/settings-sync/restore —— body `{uid, ts}`。
+async fn api_settings_sync_restore(Json(body): Json<Value>) -> Response {
+    let uid = body_text(&body, "uid");
+    let ts = body_text(&body, "ts");
+    if uid.is_empty() || ts.is_empty() {
+        return json_err("缺少 uid / ts".to_string(), StatusCode::BAD_REQUEST);
+    }
+    match tokio::task::spawn_blocking(move || settings_sync::restore_backup(&uid, &ts)).await {
+        Ok(Ok(outcome)) => json_ok(json!({ "ok": true, "outcome": outcome })),
+        Ok(Err(error)) => json_err(error, StatusCode::BAD_REQUEST),
+        Err(error) => json_err(
+            format!("还原设置备份失败: {error}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    }
+}
+
+/// GET /api/claim-ledger/summary?uid= —— 当日汇总（只读）。
+async fn api_claim_ledger_summary(RawQuery(query): RawQuery) -> Response {
+    let uid = query_param(query.as_deref(), "uid").unwrap_or_default();
+    if uid.trim().is_empty() {
+        return json_err("缺少 uid".to_string(), StatusCode::BAD_REQUEST);
+    }
+    match tokio::task::spawn_blocking(move || claim_ledger::summary(&uid)).await {
+        Ok(summary) => json_ok(summary),
+        Err(error) => json_err(
+            format!("读取领取台账失败: {error}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    }
+}
+
+/// GET /api/claim-ledger/entries?uid=&day= —— 台账明细（只读；`day` 缺省为上海当日）。
+async fn api_claim_ledger_entries(RawQuery(query): RawQuery) -> Response {
+    let uid = query_param(query.as_deref(), "uid").filter(|uid| !uid.trim().is_empty());
+    let day = query_param(query.as_deref(), "day")
+        .filter(|day| !day.trim().is_empty())
+        .unwrap_or_else(|| claim_ledger::task_day(config::now_ms()));
+    let day_for_body = day.clone();
+    match tokio::task::spawn_blocking(move || {
+        claim_ledger::entries_for(uid.as_deref(), &day)
+    })
+    .await
+    {
+        Ok(entries) => {
+            let count = entries.len();
+            json_ok(json!({ "entries": entries, "count": count, "day": day_for_body }))
+        }
+        Err(error) => json_err(
+            format!("读取领取台账明细失败: {error}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    }
+}
+
+/// D6：台账只由后端写。台账是旁路观测，写失败不影响任务列表本身。
+fn observe_claim_ledger(account: &Value, list: &Value) {
+    let Some(uid) = account::get_str(account, "uid") else {
+        return;
+    };
+    let variant = WbVariant::from_account(account);
+    if let Err(error) = claim_ledger::observe_server(&uid, variant, list) {
+        eprintln!("[claim-ledger] 记录失败：{error}");
+    }
+}
+
+/// GET /api/task-center?accountId= —— 成长任务列表（与桌面端 `list_task_center` 同源）。
+///
+/// 顺手把官方返回写进领取台账（前端只读，不提供任何写路由）。
+async fn api_task_center(RawQuery(query): RawQuery) -> Response {
+    let account_id = query_param(query.as_deref(), "accountId").unwrap_or_default();
+    let Some(account) = account::find_account(&account_id) else {
+        return json_err("账号不存在".to_string(), StatusCode::BAD_REQUEST);
+    };
+    let list = task_center::list_tasks(&account).await;
+    observe_claim_ledger(&account, &list);
+    json_ok(list)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         archive_selection, backup_file_name, body_variant, checkin_status_item, decode_archive,
         links_preview_progress_snapshot, query_variant, static_handler, submitted_config,
-        temp_archive_path, update_check_args, ProgressReset, SwitchStateGuard, TempArchive, BASE64,
+        update_check_args, ProgressReset, SwitchStateGuard, TempArchive, BASE64,
         ARCHIVE_BODY_LIMIT, LINKS_PREVIEW_CROSS_PROGRESS, LINKS_PREVIEW_PROGRESS, SWITCH_PROGRESS,
         SWITCH_RUNNING,
     };
@@ -2552,8 +2965,14 @@ mod tests {
     /// 同一瞬间的并发请求不能撞到同一个临时文件名（否则互相删/覆盖）。
     #[test]
     fn temp_archive_paths_are_unique() {
-        let first = temp_archive_path("export");
-        let second = temp_archive_path("export");
+        let first = TempArchive::new("export")
+            .expect("建临时归档")
+            .path()
+            .to_path_buf();
+        let second = TempArchive::new("export")
+            .expect("建临时归档")
+            .path()
+            .to_path_buf();
         assert_ne!(first, second);
         assert!(first.to_string_lossy().contains("wb-switch-archive-export-"));
     }
@@ -2561,7 +2980,7 @@ mod tests {
     /// 临时归档必须「用完即删」：无论正常返回还是提前出错都不留垃圾。
     #[test]
     fn temp_archive_is_removed_on_drop() {
-        let guarded = TempArchive::new("test");
+        let guarded = TempArchive::new("test").expect("建临时归档");
         let path = guarded.path().to_path_buf();
         std::fs::write(&path, b"zip").unwrap();
         drop(guarded);

@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { toast } from "sonner";
 import { BrowserRouter, HashRouter, Navigate, NavLink, Outlet, Route, Routes } from "react-router-dom";
-import { ArrowUp, Link2, ListChecks, Loader2, MessagesSquare, Play, Settings, Sparkles, User } from "lucide-react";
+import { ArrowUp, HardDrive, Link2, ListChecks, Loader2, MessagesSquare, Play, Settings, Sparkles, User } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import * as api from "@/lib/api";
@@ -9,6 +9,7 @@ import AccountsPage from "@/pages/AccountsPage";
 import SessionsPage from "@/pages/SessionsPage";
 import CreditStatsPage from "@/pages/CreditStatsPage";
 import TokenStatsPage from "@/pages/TokenStatsPage";
+import StoragePage from "@/pages/StoragePage";
 import SettingsPage from "@/pages/SettingsPage";
 import TaskCenterPage from "@/pages/TaskCenterPage";
 import { StatusDot, AppIconMark } from "@/components/product-marks";
@@ -296,6 +297,20 @@ function Layout() {
           )}
           <NavLink to="/token-stats" className={({ isActive }) => cn("flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-sm outline-none transition-colors", isActive ? "bg-foreground/[0.06] font-medium text-foreground" : "text-muted-foreground hover:bg-foreground/[0.04] hover:text-foreground")}><MessagesSquare className="size-4" />Token 统计</NavLink>
           <NavLink
+            to="/storage"
+            className={({ isActive }) =>
+              cn(
+                "flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-sm outline-none transition-colors focus-visible:ring-2 focus-visible:ring-sidebar-ring/50",
+                isActive
+                  ? "bg-foreground/[0.06] font-medium text-foreground"
+                  : "text-muted-foreground hover:bg-foreground/[0.04] hover:text-foreground",
+              )
+            }
+          >
+            <HardDrive className="size-4" />
+            存储管理
+          </NavLink>
+          <NavLink
             to="/credit-stats"
             className={({ isActive }) =>
               cn(
@@ -367,6 +382,7 @@ export default function App() {
             <Route path="/sessions" element={<SessionsPage />} />
             <Route path="/credit-stats" element={<CreditStatsPage />} />
             <Route path="/token-stats" element={<TokenStatsPage />} />
+            <Route path="/storage" element={<StoragePage />} />
             <Route path="/task-center" element={<TaskCenterPage />} />
             <Route path="/settings" element={<SettingsPage />} />
             <Route path="*" element={<Navigate to="/" replace />} />

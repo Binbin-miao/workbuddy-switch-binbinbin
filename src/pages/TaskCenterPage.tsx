@@ -16,10 +16,35 @@ import * as api from "@/lib/api";
 import { displayName } from "@/lib/account-display";
 import type {
   AccountMeta,
+  ClaimLedgerSummary,
+  ClaimState,
   GrowthAutoItem,
   TaskCenterItem,
   TaskCenterList,
 } from "@/lib/types";
+
+/**
+ * 领取台账三态文案。`unknown` 必须单独成句：查不到 ≠ 没得领（B10 / L4）。
+ */
+function claimStateLabel(summary: ClaimLedgerSummary | null): string {
+  if (!summary) return "领取状态未知（官方暂不可查）";
+  switch (summary.state) {
+    case "done":
+      return "今日已领完";
+    case "partial":
+      return `还剩 ${summary.remaining} 项`;
+    case "nothing":
+      return "今日无可领取";
+    default:
+      return "领取状态未知（官方暂不可查）";
+  }
+}
+
+function claimStateVariant(state: ClaimState | undefined): "default" | "secondary" | "outline" {
+  if (state === "partial") return "default";
+  if (state === "unknown" || state === undefined) return "outline";
+  return "secondary";
+}
 
 /**
  * 成长任务：列出 / 接受 / 领取，以及一键完成。
@@ -36,6 +61,7 @@ export default function TaskCenterPage() {
   const [busy, setBusy] = useState(false);
   const [autoRunning, setAutoRunning] = useState(false);
   const [error, setError] = useState("");
+  const [ledger, setLedger] = useState<ClaimLedgerSummary | null>(null);
 
   useEffect(() => {
     void api
@@ -67,6 +93,29 @@ export default function TaskCenterPage() {
   useEffect(() => {
     if (accountId) void load(accountId);
   }, [accountId, load]);
+
+  // 领取台账只读：后端在拉任务时写入，这里只负责展示三态文案。
+  useEffect(() => {
+    const uid = accounts.find((account) => account.id === accountId)?.uid;
+    if (!uid) {
+      setLedger(null);
+      return;
+    }
+    let disposed = false;
+    void api
+      .getClaimLedgerSummary(uid)
+      .then((summary) => {
+        if (!disposed) setLedger(summary);
+      })
+      .catch(() => {
+        // 台账是旁路信息：取不到就显示「状态未知」，不影响任务列表。
+        if (!disposed) setLedger(null);
+      });
+    // G4：账号切换 / 卸载后丢弃过期响应。
+    return () => {
+      disposed = true;
+    };
+  }, [accountId, accounts]);
 
   // 打开面板即把已达标的奖励领掉：只领该领的、幂等，不产生任何上报数据。
   // 同一账号每次进入只自动领一次，避免反复请求；失败不打扰用户，仍可用按钮手动领。
@@ -195,6 +244,9 @@ export default function TaskCenterPage() {
           <div className="flex items-center gap-2">
             <h1 className="text-xl font-semibold">成长任务</h1>
             <Badge variant="secondary">beta</Badge>
+            {accountId && (
+              <Badge variant={claimStateVariant(ledger?.state)}>{claimStateLabel(ledger)}</Badge>
+            )}
           </div>
           <p className="mt-1 text-sm text-muted-foreground">
             列出当前账号的全部成长任务，可一键接受与领取已达标的奖励。「一键完成」会替该账号触发真实行为
@@ -294,6 +346,12 @@ export default function TaskCenterPage() {
           <CardDescription>
             共 {tasks.length} 项，可领取 {claimable} 项。打开本页会自动领掉已达标的奖励；
             未接受的任务上游不返回进度——先点「一键接受任务」，之后才会开始计数。
+            <span className="mt-1 block">
+              领取台账：{claimStateLabel(ledger)}
+              {ledger?.state === "unknown"
+                ? "（官方接口本次没有返回任务数据，保留上一次的记录）"
+                : ""}
+            </span>
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-1">

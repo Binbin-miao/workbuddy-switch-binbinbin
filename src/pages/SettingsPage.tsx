@@ -48,6 +48,8 @@ import type {
   RateLimitHookStatus,
   RotateLog,
   RotateStatus,
+  SettingsBackupEntry,
+  SettingsSyncPreview,
   TravelConfig,
   UpdateInfo,
 } from "@/lib/types";
@@ -1813,6 +1815,255 @@ function CompanionCard() {
   );
 }
 
+/**
+ * 设置跨账号同步：只同步 `preferences.json`（主题 / 语言 / 布局偏好）。
+ *
+ * 开关默认开启。应用前会自动把目标现状备份到
+ * `~/.wb-switch/backups/settings/<uid>/<ts>/`，备份失败则零写入；
+ * 跨档位（国内版 ↔ 国际版）由后端直接拒绝，这里只如实展示 `blocked`。
+ */
+function SettingsSyncCard() {
+  const [accounts, setAccounts] = useState<AccountMeta[]>([]);
+  const [enabled, setEnabled] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [fromId, setFromId] = useState("");
+  const [toId, setToId] = useState("");
+  const [preview, setPreview] = useState<SettingsSyncPreview | null>(null);
+  const [backups, setBackups] = useState<SettingsBackupEntry[]>([]);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    let disposed = false;
+    void (async () => {
+      try {
+        const [config, accountList] = await Promise.all([
+          api.getSettingsSyncConfig(),
+          api.getAccounts(),
+        ]);
+        if (disposed) return;
+        setEnabled(config.enabled);
+        setAccounts(accountList.accounts);
+        if (accountList.accounts.length >= 2) {
+          setFromId(accountList.accounts[0].id);
+          setToId(accountList.accounts[1].id);
+        }
+      } catch (cause) {
+        if (!disposed) setError(api.asError(cause));
+      }
+    })();
+    // G4：卸载后不再回写状态。
+    return () => {
+      disposed = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    if (!toId) {
+      setBackups([]);
+      return () => {
+        disposed = true;
+      };
+    }
+    void (async () => {
+      try {
+        const res = await api.listSettingsSyncBackups(toId);
+        if (!disposed) setBackups(res.backups ?? []);
+      } catch {
+        // 备份列表是次要信息，取不到不影响同步本身。
+        if (!disposed) setBackups([]);
+      }
+    })();
+    return () => {
+      disposed = true;
+    };
+  }, [toId]);
+
+  async function onToggle(next: boolean) {
+    setBusy(true);
+    try {
+      const res = await api.setSettingsSyncEnabled(next);
+      setEnabled(res.enabled);
+      toast.success(res.enabled ? "已开启设置同步" : "已关闭设置同步");
+    } catch (cause) {
+      toast.error("设置同步开关失败", { description: api.asError(cause) });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function onPreview() {
+    setBusy(true);
+    setError("");
+    try {
+      setPreview(await api.previewSettingsSync(fromId, toId));
+    } catch (cause) {
+      setPreview(null);
+      setError(api.asError(cause));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function onApply() {
+    setBusy(true);
+    try {
+      const res = await api.applySettingsSync(fromId, toId);
+      const outcome = res.outcome;
+      if (outcome?.note) {
+        toast.info(outcome.note);
+      } else {
+        toast.success(`已写入 ${(outcome?.keys_written ?? []).length} 个键`, {
+          description: outcome?.backup_dir ? `已备份到 ${outcome.backup_dir}` : undefined,
+        });
+      }
+      const [refreshed, backupList] = await Promise.all([
+        api.previewSettingsSync(fromId, toId).catch(() => null),
+        api.listSettingsSyncBackups(toId).catch(() => null),
+      ]);
+      setPreview(refreshed);
+      if (backupList) setBackups(backupList.backups ?? []);
+    } catch (cause) {
+      toast.error("同步设置失败", { description: api.asError(cause) });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function onRestore(ts: string) {
+    setBusy(true);
+    try {
+      await api.restoreSettingsSyncBackup(toId, ts);
+      toast.success("已从备份还原目标账号的设置");
+    } catch (cause) {
+      toast.error("还原失败", { description: api.asError(cause) });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const ready = accounts.length >= 2 && fromId !== "" && toId !== "" && fromId !== toId;
+
+  return (
+    <SettingsGroup id="settings-sync" title="设置跨账号同步">
+      <CardContent className="space-y-0 p-0">
+        <SettingsFieldRow
+          label="切号后同步界面设置"
+          description="只同步 preferences.json（主题 / 语言 / 布局）。设备本地状态（窗口位置、更新检查时间）不会同步。"
+          htmlFor="settings-sync-enabled"
+        >
+          <Switch
+            id="settings-sync-enabled"
+            checked={enabled}
+            disabled={busy}
+            onCheckedChange={(value) => void onToggle(value)}
+            aria-label="开启设置跨账号同步"
+          />
+        </SettingsFieldRow>
+
+        <SettingsFieldRow
+          className="border-b-0"
+          label="复制设置"
+          description={
+            accounts.length < 2
+              ? "至少需要两个账号才能跨账号复制设置。"
+              : "目标账号独有的设置项会被保留，不会被覆盖。"
+          }
+        >
+          <div className="flex w-full flex-col gap-2 sm:w-auto">
+            <div className="flex flex-wrap items-center gap-2">
+              <Select value={fromId} onValueChange={setFromId}>
+                <SelectTrigger className="w-44" aria-label="来源账号">
+                  <SelectValue placeholder="来源账号" />
+                </SelectTrigger>
+                <SelectContent>
+                  {accounts.map((account) => (
+                    <SelectItem key={account.id} value={account.id}>
+                      {displayName(account)}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <span className="text-xs text-muted-foreground">→</span>
+              <Select value={toId} onValueChange={setToId}>
+                <SelectTrigger className="w-44" aria-label="目标账号">
+                  <SelectValue placeholder="目标账号" />
+                </SelectTrigger>
+                <SelectContent>
+                  {accounts.map((account) => (
+                    <SelectItem key={account.id} value={account.id}>
+                      {displayName(account)}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <Button size="sm" variant="outline" onClick={() => void onPreview()} disabled={busy || !ready}>
+                {busy && <Loader2 className="size-4 animate-spin" />}
+                预览
+              </Button>
+              <Button size="sm" onClick={() => void onApply()} disabled={busy || !ready}>
+                应用到目标账号
+              </Button>
+            </div>
+            {error && <div className="text-xs text-destructive">{error}</div>}
+          </div>
+        </SettingsFieldRow>
+
+        {preview && (
+          <div className="space-y-1.5 border-t border-foreground/10 px-4 py-3 text-xs">
+            {preview.blocked ? (
+              <div className="text-amber-600 dark:text-amber-500">{preview.blocked}</div>
+            ) : (
+              <>
+                <div className="text-muted-foreground">
+                  将覆盖 {preview.keys_changed.length} 个键
+                  {preview.keys_changed.length > 0
+                    ? `：${preview.keys_changed.slice(0, 6).join("、")}${
+                        preview.keys_changed.length > 6 ? " 等" : ""
+                      }`
+                    : "（已是最新）"}
+                </div>
+                <div className="text-muted-foreground">
+                  目标独有、保持原样 {preview.keys_kept.length} 个键
+                  {preview.keys_kept.length > 0
+                    ? `：${preview.keys_kept.slice(0, 6).join("、")}${
+                        preview.keys_kept.length > 6 ? " 等" : ""
+                      }`
+                    : ""}
+                </div>
+              </>
+            )}
+          </div>
+        )}
+
+        {backups.length > 0 && (
+          <div className="space-y-1 border-t border-foreground/10 px-4 py-3">
+            <div className="text-[13px] font-medium leading-5">目标账号的备份</div>
+            <div className="max-h-40 space-y-1 overflow-y-auto">
+              {backups.slice(0, 10).map((backup) => (
+                <div
+                  key={backup.ts}
+                  className="flex items-center justify-between gap-3 text-xs text-muted-foreground"
+                >
+                  <span className="tabular-nums">{backup.ts}</span>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    disabled={busy}
+                    onClick={() => void onRestore(backup.ts)}
+                  >
+                    还原
+                  </Button>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </CardContent>
+    </SettingsGroup>
+  );
+}
+
 /** 外观：主题选择（持久化到 localStorage）。 */
 const NOTIFICATION_LEVEL_LABEL: Record<AppNotification["level"], string> = {
   success: "成功",
@@ -2349,6 +2600,7 @@ export default function SettingsPage() {
         <AutoRotateCard />
         <RateLimitCard />
         {api.isDesktop() && !api.isDemoMode() ? <CompanionCard /> : null}
+        {api.isDemoMode() ? null : <SettingsSyncCard />}
         {api.isDesktop() || api.isDemoMode() ? <StartupCard /> : null}
         {api.isDemoMode() ? null : <DataMigrationCard />}
         <NotificationHistoryCard />

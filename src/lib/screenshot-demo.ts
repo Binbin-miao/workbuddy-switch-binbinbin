@@ -999,6 +999,59 @@ export function screenshotDemoResponse(command: string, args?: Record<string, un
     case "check_update": return { ok: true, current: "0.1.24", latest: "0.1.25", latestTag: "v0.1.25", hasUpdate: true, releaseName: "更新提示演示", releaseUrl: GITHUB_RELEASE_URL };
     case "get_launch_at_login_enabled": return true;
     case "switch_progress": return { running: false, progress: null };
+    // 存储管理：四分类都必须有演示数据，否则演示构建的存储页会白屏（B13）。
+    case "storage_scan": return demoStorageSnapshot();
+    case "storage_sessions": return { assets: demoSessionAssets(), count: demoSessionAssets().length };
+    case "storage_trash": return demoTrashList();
+    case "storage_revalidate": return { changed: false, signature: "demo-signature" };
+    // 设置跨账号同步
+    case "settings_sync_config": return { enabled: true, lastRunAt: null };
+    case "settings_sync_backups": return { backups: [], count: 0 };
+    // 领取台账（只读）
+    case "claim_ledger_summary": return demoClaimSummary(String(args?.uid ?? ""));
+    case "claim_ledger_entries": return { entries: [], count: 0, day: "2026-03-10" };
     default: throw new Error(`演示模式缺少只读数据: ${command}`);
   }
+}
+
+/** 演示：存储四分类体积（含一个 partial，好让「体积可能偏小」提示可见）。 */
+function demoStorageSnapshot() {
+  return {
+    generated_at: 1_772_000_000_000,
+    usage: [
+      { category: "tool", bytes: 18_874_368, files: 42, partial: false, exists: true },
+      { category: "client", bytes: 268_435_456, files: 3_120, partial: false, exists: true },
+      // 会话资产演示一条 partial，验证「部分目录无权限」文案。
+      { category: "sessions", bytes: 41_943_040, files: 860, partial: true, exists: true },
+      { category: "trash", bytes: 1_048_576, files: 12, partial: false, exists: true },
+    ],
+    trash: demoTrashList().entries,
+    trash_bytes: 1_048_576,
+  };
+}
+
+/** 演示：会话资产明细。 */
+function demoSessionAssets() {
+  return [
+    { path: "/demo/.workbuddy/projects/demo-workspace/session-001", project: "demo-workspace", name: "session-001", variant: "cn", bytes: 20_971_520, files: 412, modified_at: 1_771_900_000_000 },
+    { path: "/demo/.workbuddy/projects/demo-workspace/session-002", project: "demo-workspace", name: "session-002", variant: "cn", bytes: 12_582_912, files: 270, modified_at: 1_771_800_000_000 },
+    { path: "/demo/.workbuddy/projects/demo-archive/session-003", project: "demo-archive", name: "session-003", variant: "cn", bytes: 8_388_608, files: 178, modified_at: 1_771_700_000_000 },
+  ];
+}
+
+/** 演示：回收站（第二条清单损坏，用来验证「禁止还原」按钮置灰）。 */
+function demoTrashList() {
+  const entries = [
+    { id: "20260310-094500", created_at: 1_771_987_500_000, bytes: 1_048_576, items: 12, reason: "storage_clean", manifest_ok: true },
+    { id: "20260309-181200", created_at: 1_771_887_200_000, bytes: 524_288, items: 4, reason: "storage_clean", manifest_ok: false },
+  ];
+  return { entries, count: entries.length, bytes: 1_572_864 };
+}
+
+/** 演示：领取台账三态（按 uid 稳定映射，便于截图对照）。 */
+function demoClaimSummary(uid: string) {
+  const cursor = uid.length % 3;
+  if (cursor === 1) return { state: "done", remaining: 0, day: "2026-03-10" };
+  if (cursor === 2) return { state: "partial", remaining: 3, day: "2026-03-10" };
+  return { state: "nothing", remaining: 0, day: "2026-03-10" };
 }

@@ -10,12 +10,12 @@ use serde_json::{json, Value};
 
 use tauri::Emitter;
 use wb_switch_core::modules::{
-    account, archive, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, codebuddy_ide,
-    codebuddy_ide_session, codebuddy_ide_session_sync, credit_usage, credits, error_log,
-    export_import, growth_tasks, jetbrains, limits, memory, mirror, notifications, oauth, process,
-    rate_limit_events, rate_limit_hook, refresh, rotate, session, session_groups, switch,
-    task_center, token_stats, travel, update, variant::WbVariant, vscode_ext, vscode_session,
-    vscode_session_sync, web_activity,
+    account, archive, auth_file, checkin, claim_ledger, codebuddy_cli, codebuddy_cn_ide,
+    codebuddy_ide, codebuddy_ide_session, codebuddy_ide_session_sync, config, credit_usage,
+    credits, error_log, export_import, growth_tasks, jetbrains, limits, memory, mirror,
+    notifications, oauth, process, rate_limit_events, rate_limit_hook, refresh, rotate, session,
+    session_groups, settings_sync, storage, switch, task_center, token_stats, travel, update,
+    variant::WbVariant, vscode_ext, vscode_session, vscode_session_sync, web_activity,
 };
 
 #[derive(Serialize)]
@@ -1193,7 +1193,15 @@ pub async fn get_credit_statistics(refresh: Option<bool>) -> Value {
 #[tauri::command(rename_all = "camelCase")]
 pub async fn list_task_center(account_id: String) -> Result<Value, String> {
     let acc = account::find_account(&account_id).ok_or("账号不存在")?;
-    Ok(task_center::list_tasks(&acc).await)
+    let list = task_center::list_tasks(&acc).await;
+    // D6：台账只由后端写。旁路观测失败不影响任务列表本身。
+    if let Some(uid) = account::get_str(&acc, "uid") {
+        let variant = WbVariant::from_account(&acc);
+        if let Err(error) = claim_ledger::observe_server(&uid, variant, &list) {
+            eprintln!("[claim-ledger] 记录失败：{error}");
+        }
+    }
+    Ok(list)
 }
 
 /// POST /api/task-center/accept —— 批量接受尚未接受的任务（beta，接口幂等）。
@@ -1765,4 +1773,215 @@ pub async fn list_notifications() -> Result<Value, String> {
 #[tauri::command]
 pub async fn clear_notifications() -> Result<(), String> {
     notifications::clear()
+}
+
+// ---------------------------------------------------------------------------
+// 存储管理（对应 /api/storage/*）
+//
+// 全部以 `serde_json::to_value` 输出：桌面端与 webui 的 JSON 键名因此完全一致
+// （不依赖 Tauri 对返回值是否做命名转换），前端只需维护一套类型。
+// ---------------------------------------------------------------------------
+
+fn response_json<T: Serialize>(value: T) -> Result<Value, String> {
+    serde_json::to_value(value).map_err(|error| format!("序列化响应失败: {error}"))
+}
+
+/// GET /api/storage/scan —— 四分类体积总览（后端 60 秒共享快照）。
+#[tauri::command]
+pub async fn storage_scan() -> Result<Value, String> {
+    let snapshot = tauri::async_runtime::spawn_blocking(storage::shared_snapshot)
+        .await
+        .map_err(|error| format!("读取存储快照失败: {error}"))?;
+    response_json(snapshot)
+}
+
+/// GET /api/storage/sessions —— 会话资产明细（默认 200 条，上限 2000）。
+#[tauri::command(rename_all = "snake_case")]
+pub async fn storage_sessions(limit: Option<usize>) -> Result<Value, String> {
+    let limit = limit.unwrap_or(200).min(2_000);
+    let assets = tauri::async_runtime::spawn_blocking(move || storage::list_session_assets(limit))
+        .await
+        .map_err(|error| format!("列出会话资产失败: {error}"))?;
+    let count = assets.len();
+    Ok(json!({ "assets": assets, "count": count }))
+}
+
+/// POST /api/storage/clean —— `dry_run` 缺省 `true`（不传只预览，一个字节都不动）。
+#[tauri::command(rename_all = "snake_case")]
+pub async fn storage_clean(
+    category: String,
+    older_than_days: Option<u32>,
+    dry_run: Option<bool>,
+) -> Result<Value, String> {
+    let parsed = storage::StorageCategory::parse(&category)
+        .ok_or_else(|| format!("缺少或无法识别的 category：{category}"))?;
+    if !parsed.is_cleanable() {
+        return Err("回收站只能彻底删除，不参与清理".to_string());
+    }
+    let dry_run = dry_run.unwrap_or(true);
+    let plan =
+        tauri::async_runtime::spawn_blocking(move || storage::plan_clean(parsed, older_than_days))
+            .await
+            .map_err(|error| format!("生成清理计划失败: {error}"))??;
+    let plan_json = response_json(&plan)?;
+    let outcome =
+        tauri::async_runtime::spawn_blocking(move || storage::execute_clean(&plan, dry_run))
+            .await
+            .map_err(|error| format!("执行清理失败: {error}"))??;
+    Ok(json!({ "ok": true, "plan": plan_json, "outcome": outcome }))
+}
+
+/// GET /api/storage/trash —— 回收站列表。
+#[tauri::command]
+pub async fn storage_trash() -> Result<Value, String> {
+    let entries = tauri::async_runtime::spawn_blocking(storage::list_trash)
+        .await
+        .map_err(|error| format!("读取回收站失败: {error}"))?;
+    let count = entries.len();
+    let bytes: u64 = entries.iter().map(|entry| entry.bytes).sum();
+    Ok(json!({ "entries": entries, "count": count, "bytes": bytes }))
+}
+
+/// POST /api/storage/trash/restore —— `overwrite` 缺省 `false`（不覆盖同名目标）。
+#[tauri::command(rename_all = "snake_case")]
+pub async fn storage_trash_restore(id: String, overwrite: Option<bool>) -> Result<Value, String> {
+    let overwrite = overwrite.unwrap_or(false);
+    let outcome = tauri::async_runtime::spawn_blocking(move || storage::restore_trash(&id, overwrite))
+        .await
+        .map_err(|error| format!("还原回收站条目失败: {error}"))??;
+    Ok(json!({ "ok": true, "outcome": outcome }))
+}
+
+/// POST /api/storage/trash/purge —— `id` 缺省清空全部（唯一不可恢复动作）。
+#[tauri::command(rename_all = "snake_case")]
+pub async fn storage_trash_purge(id: Option<String>) -> Result<Value, String> {
+    let id = id.filter(|value| !value.trim().is_empty());
+    let outcome = tauri::async_runtime::spawn_blocking(move || storage::purge_trash(id.as_deref()))
+        .await
+        .map_err(|error| format!("彻底删除回收站条目失败: {error}"))??;
+    Ok(json!({ "ok": true, "outcome": outcome }))
+}
+
+/// POST /api/storage/reveal —— 在文件管理器中定位（非桌面宿主返回可读错误）。
+#[tauri::command(rename_all = "snake_case")]
+pub async fn storage_reveal(path: String) -> Result<(), String> {
+    let target = path.trim();
+    if target.is_empty() {
+        return Err("缺少 path".to_string());
+    }
+    storage::reveal(Path::new(target))
+}
+
+/// POST /api/storage/revalidate —— 只校验当前页的一层签名。
+#[tauri::command(rename_all = "snake_case")]
+pub async fn storage_revalidate(page: String, signature: String) -> Result<Value, String> {
+    let report = tauri::async_runtime::spawn_blocking(move || {
+        storage::revalidate_page(&page, &signature)
+    })
+    .await
+    .map_err(|error| format!("校验存储页面失败: {error}"))?;
+    response_json(report)
+}
+
+// ---------------------------------------------------------------------------
+// 设置跨账号同步（对应 /api/settings-sync/*）
+// ---------------------------------------------------------------------------
+
+/// GET /api/settings-sync/config —— 开关 + 最近一次同步时刻。
+#[tauri::command]
+pub async fn settings_sync_config() -> Result<Value, String> {
+    let config = settings_sync::load_config();
+    let last = config
+        .last_run_at
+        .or_else(|| settings_sync::last_run_at(&config::store_dir()));
+    Ok(json!({ "enabled": config.enabled, "lastRunAt": last }))
+}
+
+/// POST /api/settings-sync/config —— 只切开关，不动其它字段。
+#[tauri::command]
+pub async fn settings_sync_set_config(enabled: bool) -> Result<Value, String> {
+    let mut config = settings_sync::load_config();
+    config.enabled = enabled;
+    settings_sync::save_config(&config)?;
+    Ok(json!({ "ok": true, "enabled": config.enabled }))
+}
+
+/// POST /api/settings-sync/preview —— 预览将被覆盖 / 保留的键。
+#[tauri::command(rename_all = "snake_case")]
+pub async fn settings_sync_preview(from_uid: String, to_uid: String) -> Result<Value, String> {
+    let preview =
+        tauri::async_runtime::spawn_blocking(move || settings_sync::preview(&from_uid, &to_uid))
+            .await
+            .map_err(|error| format!("预览设置同步失败: {error}"))??;
+    response_json(preview)
+}
+
+/// POST /api/settings-sync/apply —— 备份前置，备份失败即零写入。
+#[tauri::command(rename_all = "snake_case")]
+pub async fn settings_sync_apply(
+    from_uid: String,
+    to_uid: String,
+    keys: Option<Vec<String>>,
+) -> Result<Value, String> {
+    let outcome = tauri::async_runtime::spawn_blocking(move || {
+        settings_sync::apply(&from_uid, &to_uid, keys.as_deref())
+    })
+    .await
+    .map_err(|error| format!("执行设置同步失败: {error}"))??;
+    Ok(json!({ "ok": true, "outcome": outcome }))
+}
+
+/// GET /api/settings-sync/backups —— 备份列表（新的在前）。
+#[tauri::command(rename_all = "snake_case")]
+pub async fn settings_sync_backups(uid: String) -> Result<Value, String> {
+    let entries = tauri::async_runtime::spawn_blocking(move || settings_sync::list_backups(&uid))
+        .await
+        .map_err(|error| format!("读取设置备份失败: {error}"))?;
+    let count = entries.len();
+    Ok(json!({ "backups": entries, "count": count }))
+}
+
+/// POST /api/settings-sync/restore —— 从指定备份还原。
+#[tauri::command(rename_all = "snake_case")]
+pub async fn settings_sync_restore(uid: String, ts: String) -> Result<Value, String> {
+    let outcome =
+        tauri::async_runtime::spawn_blocking(move || settings_sync::restore_backup(&uid, &ts))
+            .await
+            .map_err(|error| format!("还原设置备份失败: {error}"))??;
+    Ok(json!({ "ok": true, "outcome": outcome }))
+}
+
+// ---------------------------------------------------------------------------
+// 领取台账（只读；写入只发生在后端，见 list_task_center）
+// ---------------------------------------------------------------------------
+
+/// GET /api/claim-ledger/summary —— 当日汇总。
+#[tauri::command(rename_all = "snake_case")]
+pub async fn claim_ledger_summary(uid: String) -> Result<Value, String> {
+    if uid.trim().is_empty() {
+        return Err("缺少 uid".to_string());
+    }
+    let summary = tauri::async_runtime::spawn_blocking(move || claim_ledger::summary(&uid))
+        .await
+        .map_err(|error| format!("读取领取台账失败: {error}"))?;
+    response_json(summary)
+}
+
+/// GET /api/claim-ledger/entries —— 台账明细（`day` 缺省为上海当日）。
+#[tauri::command(rename_all = "snake_case")]
+pub async fn claim_ledger_entries(
+    uid: Option<String>,
+    day: Option<String>,
+) -> Result<Value, String> {
+    let uid = uid.filter(|value| !value.trim().is_empty());
+    let day = day
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| claim_ledger::task_day(config::now_ms()));
+    let day_for_body = day.clone();
+    let entries =
+        tauri::async_runtime::spawn_blocking(move || claim_ledger::entries_for(uid.as_deref(), &day))
+            .await
+            .map_err(|error| format!("读取领取台账明细失败: {error}"))?;
+    let count = entries.len();
+    Ok(json!({ "entries": entries, "count": count, "day": day_for_body }))
 }

@@ -68,6 +68,20 @@ import type {
   VscodeSessionList,
   VscodeSessionRef,
   WbVariant,
+  ClaimLedgerEntries,
+  ClaimLedgerSummary,
+  PurgeOutcome,
+  RestoreOutcome,
+  SessionAssetList,
+  SettingsBackupList,
+  SettingsSyncApplyResult,
+  SettingsSyncConfig,
+  SettingsSyncPreview,
+  StorageCleanResult,
+  StorageRevalidateResult,
+  StorageSnapshot,
+  StorageCategoryId,
+  TrashList,
 } from "./types";
 import { DEMO_UNAVAILABLE_MESSAGE, demoModeEnabled } from "./demo-mode";
 import { screenshotDemoResponse } from "./screenshot-demo";
@@ -87,6 +101,9 @@ const DEMO_READ_COMMANDS = new Set([
   "get_github_config", "check_update", "get_launch_at_login_enabled", "switch_progress",
   "get_travel_status", "get_auto_travel_config", "get_rate_limits",
   "get_rate_limit_hook_status", "get_rate_limit_config",
+  "storage_scan", "storage_sessions", "storage_trash", "storage_revalidate",
+  "settings_sync_config", "settings_sync_backups",
+  "claim_ledger_summary", "claim_ledger_entries",
 ]);
 
 export function isDemoMode(): boolean {
@@ -225,6 +242,27 @@ const ROUTES: Record<string, Route> = {
   archive_export: { method: "POST", path: "/api/archive/export" },
   archive_inspect: { method: "POST", path: "/api/archive/inspect" },
   archive_import: { method: "POST", path: "/api/archive/import" },
+  // 存储管理
+  storage_scan: { method: "GET", path: "/api/storage/scan" },
+  storage_sessions: { method: "GET", path: "/api/storage/sessions" },
+  storage_clean: { method: "POST", path: "/api/storage/clean" },
+  storage_trash: { method: "GET", path: "/api/storage/trash" },
+  storage_trash_restore: { method: "POST", path: "/api/storage/trash/restore" },
+  storage_trash_purge: { method: "POST", path: "/api/storage/trash/purge" },
+  storage_reveal: { method: "POST", path: "/api/storage/reveal" },
+  storage_revalidate: { method: "POST", path: "/api/storage/revalidate" },
+  // 设置跨账号同步
+  settings_sync_config: { method: "GET", path: "/api/settings-sync/config" },
+  settings_sync_set_config: { method: "POST", path: "/api/settings-sync/config" },
+  settings_sync_preview: { method: "POST", path: "/api/settings-sync/preview" },
+  settings_sync_apply: { method: "POST", path: "/api/settings-sync/apply" },
+  settings_sync_backups: { method: "GET", path: "/api/settings-sync/backups" },
+  settings_sync_restore: { method: "POST", path: "/api/settings-sync/restore" },
+  // 领取台账（只读）
+  claim_ledger_summary: { method: "GET", path: "/api/claim-ledger/summary" },
+  claim_ledger_entries: { method: "GET", path: "/api/claim-ledger/entries" },
+  // 成长任务（webui 侧此前缺这条路由映射）
+  list_task_center: { method: "GET", path: "/api/task-center" },
 };
 
 /**
@@ -1404,4 +1442,124 @@ export function getErrorLogPath(): Promise<string> {
 export function revealErrorLog(): Promise<void> {
   if (demoModeEnabled || isWebui()) return Promise.resolve();
   return call<unknown>("reveal_error_log").then(() => undefined);
+}
+
+// ---------------------------------------------------------------------------
+// 存储管理
+// ---------------------------------------------------------------------------
+
+/** 四分类体积总览。后端持 60 秒共享快照，前端不做二次缓存。 */
+export function scanStorage(): Promise<StorageSnapshot> {
+  return call("storage_scan");
+}
+
+/** 会话资产明细（默认 200 条）。 */
+export function listStorageSessions(limit = 200): Promise<SessionAssetList> {
+  return call("storage_sessions", { limit });
+}
+
+/**
+ * 生成清理计划并按需执行。
+ *
+ * `dryRun` 默认 `true`：只回计划、一个字节都不动；必须显式传 `false` 才会真的
+ * 移入回收站（后端同样默认 true，两边都不依赖调用方记得传）。
+ */
+export function cleanStorage(options: {
+  category: StorageCategoryId;
+  olderThanDays?: number;
+  dryRun?: boolean;
+}): Promise<StorageCleanResult> {
+  return call("storage_clean", {
+    category: options.category,
+    older_than_days: options.olderThanDays,
+    dry_run: options.dryRun ?? true,
+  });
+}
+
+/** 回收站列表。 */
+export function listStorageTrash(): Promise<TrashList> {
+  return call("storage_trash");
+}
+
+/** 还原回收站条目；`overwrite=false` 时同名目标跳过（不覆盖）。 */
+export function restoreStorageTrash(
+  id: string,
+  overwrite = false,
+): Promise<{ ok: boolean; outcome?: RestoreOutcome }> {
+  return call("storage_trash_restore", { id, overwrite });
+}
+
+/** 彻底删除回收站条目；不传 `id` 即清空全部（唯一不可恢复动作）。 */
+export function purgeStorageTrash(
+  id?: string,
+): Promise<{ ok: boolean; outcome?: PurgeOutcome }> {
+  return call("storage_trash_purge", id ? { id } : {});
+}
+
+/** 在文件管理器中定位；浏览器 / 服务端模式由后端回 501。 */
+export function revealStoragePath(path: string): Promise<{ ok: boolean }> {
+  return call("storage_reveal", { path });
+}
+
+/** 轻量校验当前页签名（后端 3 秒防抖）。 */
+export function revalidateStorage(
+  page: string,
+  signature: string,
+): Promise<StorageRevalidateResult> {
+  return call("storage_revalidate", { page, signature });
+}
+
+// ---------------------------------------------------------------------------
+// 设置跨账号同步
+// ---------------------------------------------------------------------------
+
+export function getSettingsSyncConfig(): Promise<SettingsSyncConfig> {
+  return call("settings_sync_config");
+}
+
+export function setSettingsSyncEnabled(
+  enabled: boolean,
+): Promise<{ ok: boolean; enabled: boolean }> {
+  return call("settings_sync_set_config", { enabled });
+}
+
+export function previewSettingsSync(
+  fromUid: string,
+  toUid: string,
+): Promise<SettingsSyncPreview> {
+  return call("settings_sync_preview", { from_uid: fromUid, to_uid: toUid });
+}
+
+export function applySettingsSync(
+  fromUid: string,
+  toUid: string,
+  keys?: string[],
+): Promise<SettingsSyncApplyResult> {
+  return call("settings_sync_apply", { from_uid: fromUid, to_uid: toUid, keys });
+}
+
+export function listSettingsSyncBackups(uid: string): Promise<SettingsBackupList> {
+  return call("settings_sync_backups", { uid });
+}
+
+export function restoreSettingsSyncBackup(
+  uid: string,
+  ts: string,
+): Promise<SettingsSyncApplyResult> {
+  return call("settings_sync_restore", { uid, ts });
+}
+
+// ---------------------------------------------------------------------------
+// 领取台账（只读；写入只发生在后端）
+// ---------------------------------------------------------------------------
+
+export function getClaimLedgerSummary(uid: string): Promise<ClaimLedgerSummary> {
+  return call("claim_ledger_summary", { uid });
+}
+
+export function listClaimLedgerEntries(
+  uid?: string,
+  day?: string,
+): Promise<ClaimLedgerEntries> {
+  return call("claim_ledger_entries", { uid, day });
 }
