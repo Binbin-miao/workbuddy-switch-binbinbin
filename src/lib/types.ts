@@ -741,7 +741,7 @@ export interface ActivityResult {
   /** 会话状态：completed / working / failed。 */
   status?: string;
   conversation?: string;
-  /** 实际使用的模型（默认只有免费的 hy3；付费兜底需手改配置授权）。 */
+  /** 实际使用的模型（默认只有免费的 Hy4 flash；付费兜底需手改配置授权）。 */
   model?: string;
   modelsTried?: string[];
   elapsedMs?: number;

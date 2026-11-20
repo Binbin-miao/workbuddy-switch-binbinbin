@@ -32,7 +32,7 @@
    ```json
    {
      "prompt": "Hi",
-     "model": "hy3",
+     "model": "hy4flash-free",
      "conversationOrigin": "workbuddy-app",
      "plugins": [{ "name": "weixinpay", "marketplace": "codebuddy-builtin" }]
    }
@@ -64,11 +64,15 @@
 
 | 模型 | 倍率 | 上下文 | 实测单次成本 |
 |---|---|---|---|
-| `hy3` | x0.00 | 192k | **0.00** |
+| `hy4flash-free` | x0.00 | 960k | **0.00** |
 | `deepseek-v4.1-flash` | x0.11 | 300k | 9.36 |
 
-打卡只需要一句「Hi」加一段短回复，默认只试免费的 `hy3`；`hy3` 失败（限流/下线）
-且用户已显式授权付费模型时，才顺延到 `deepseek-v4.1-flash`。
+打卡只需要一句「Hi」加一段短回复，默认只试免费的 `hy4flash-free`；免费档失败
+（限流/活动结束）且用户已显式授权付费模型时，才顺延到 `deepseek-v4.1-flash`。
+
+> 旧值 `hy3` 已从模型清单下线。替代档位：同模型的付费档 `hy4flash`（x0.03）最接近，
+> 但要求 `allow_paid_model: true` 才会被使用。注意 `hy4free` 是 `hy4std`（Hy4，x0.29）
+> 的别名，**不是**免费档，别拿它当免费模型用。
 
 **注意**：网页通道无法单独下调思考档位。ACP 只提供 `session/set_model`，没有
 reasoning effort 方法，所以 `deepseek-v4.1-flash` 的 `onlyReasoning: true` /
@@ -78,7 +82,7 @@ reasoning effort 方法，所以 `deepseek-v4.1-flash` 的 `onlyReasoning: true`
 
 ## 付费模型授权
 
-开关默认**不含**付费模型：只试 `hy3`（免费）。需要顺延时，手改
+开关默认**不含**付费模型：只试 `hy4flash-free`（免费）。需要顺延时，手改
 `~/.wb-switch/daily_activity_config.json`，把 `"allow_paid_model"` 设为 `true`，
 再重启 App（后台调度在启动时读配置）：
 

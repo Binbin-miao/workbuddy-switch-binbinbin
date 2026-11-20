@@ -401,8 +401,10 @@ const DEFAULT_CHAT_PROMPT: &str = "1+1等于几？直接回答。";
 /// 成长任务沿用的通用模型。
 const GROWTH_CHAT_MODEL: &str = "fast-model";
 
-/// 日常对话（签到后补的那条）用的模型：Hy3 当前限时免费，消耗倍率 0.00x。
-pub const DAILY_CHAT_MODEL: &str = "hy3";
+/// 日常对话（签到后补的那条）用的模型：Hy4 flash 当前限时免费，消耗倍率 0.00x。
+///
+/// 旧值 `hy3` 已从模型清单下线；`hy4flash`（同模型付费档，x0.03）可作直接替代。
+pub const DAILY_CHAT_MODEL: &str = "hy4flash-free";
 
 /// 免费模型下线 / 被拒时的兜底模型，保证签到流程不受影响。
 const FALLBACK_CHAT_MODEL: &str = GROWTH_CHAT_MODEL;
@@ -1847,7 +1849,7 @@ mod tests {
 
     #[test]
     fn daily_chat_uses_free_model() {
-        assert_eq!(DAILY_CHAT_MODEL, "hy3");
+        assert_eq!(DAILY_CHAT_MODEL, "hy4flash-free");
     }
 
     #[test]

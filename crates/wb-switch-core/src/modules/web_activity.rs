@@ -37,16 +37,18 @@ const WEB_ORIGIN: &str = "https://www.workbuddy.ai";
 const CONVERSATIONS_URL: &str = "https://www.workbuddy.ai/console/as/conversations/";
 /// 免费模型：恒在候选列表里。
 ///
-/// 官方国际版模型的积分倍率（`wb_catalog` 的 `credits` 字段，实测 2026-11）：
-/// - `hy3`                 x0.00（免费，192k 上下文）→ 实测一次 40 段输出，成本 0.00
+/// 官方国际版模型的积分倍率（产品配置 `models[].credits`，实测 2026-11-20）：
+/// - `hy4flash-free`       x0.00（限时免费，960k 上下文，当前默认模型）
+/// - `hy4flash`            x0.03（同模型付费档，免费档下线后的直接替代）
 /// - `deepseek-v4.1-flash` x0.11（300k，effort=high）→ 实测一次 115 段输出，成本 9.36
+/// - `hy4std`              x0.29（旧别名 `hy4free` 指向它，**不是**免费档）
 ///
-/// 打卡只需要一句「Hi」加一段短回复，没必要用付费模型；`hy3` 不可用（限流 /
-/// 下线）时才顺延到付费备选，且必须由用户显式授权（`allow_paid_model`）。
+/// 打卡只需要一句「Hi」加一段短回复，没必要用付费模型；免费档不可用（限流 /
+/// 活动结束）时才顺延到付费备选，且必须由用户显式授权（`allow_paid_model`）。
 /// 注意网页通道**无法**单独下调思考档位：ACP 只提供 `session/set_model`，没有
 /// reasoning effort 方法，所以 `deepseek-v4.1-flash` 的 `onlyReasoning: true /
 /// defaultEffort: high` 改不动——省钱只能换模型，不能调参。
-const FREE_MODEL: &str = "hy3";
+const FREE_MODEL: &str = "hy4flash-free";
 /// 付费备用模型：仅在 `allow_paid_model == true` 时进入候选列表。
 const PAID_MODEL: &str = "deepseek-v4.1-flash";
 /// 沙箱域名后缀（E2B on 腾讯云 CloudStudio）。
@@ -892,12 +894,15 @@ mod tests {
 
     #[test]
     fn 模型候选_默认只含免费模型() {
-        assert_eq!(model_candidates(false), vec!["hy3"]);
+        assert_eq!(model_candidates(false), vec!["hy4flash-free"]);
     }
 
     #[test]
     fn 模型候选_开启付费授权后追加付费模型() {
-        assert_eq!(model_candidates(true), vec!["hy3", "deepseek-v4.1-flash"]);
+        assert_eq!(
+            model_candidates(true),
+            vec!["hy4flash-free", "deepseek-v4.1-flash"]
+        );
     }
 
     #[test]
