@@ -32,6 +32,14 @@ external binary. For cross-target builds, set `AGENT_COMPANION_TARGET` to the
 same Rust triple passed to `tauri build --target`; the release workflow does
 this for each platform.
 
+> ⚠️ **绕过 Tauri 钩子打包时，必须手动跑 `npm run build:desktop`。**
+> 发行脚本为绕开 MSVC PATH 问题，常把 `build.beforeBuildCommand` 置空再用
+> `npm run build` 单独构建前端——但 `npm run build` **不**产出 `dist/companion/`。
+> 少了这一步，悬浮窗窗口请求 `/companion/desktop.html` 会被 SPA 兜底回落到
+> `index.html`，表现为「会话栏里塞着整个主界面、内容挤成一列竖排字」
+> （0.1.90 的线上 bug，0.1.91 修复）。打包前自检：
+> `test -f dist/companion/desktop.html && test -f dist/companion/desktop-settings.html`。
+
 The installed app contains a single wb-switch tray. The built-in component
 does not create another tray or login item. The packaged files are a baseline
 for a future separately updated UI/runtime; the current integration does not
